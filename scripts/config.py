@@ -7,7 +7,7 @@ load_dotenv()
 
 # === Trading Parameters ===
 CONFIG = {
-    "entry_threshold": 0.08,       # Min 8% edge to enter
+    "entry_threshold": 0.05,       # Min 5% edge to enter
     "exit_threshold": 0.45,        # Sell when bucket price > 45c
     "max_position_usd": 2.00,      # Max $2 per bucket
     "max_open_positions": 15,      # Max 15 concurrent (laddering across buckets)
