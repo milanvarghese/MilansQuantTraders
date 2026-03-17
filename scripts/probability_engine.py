@@ -1,11 +1,19 @@
-"""Probability engine: converts GFS ensemble forecasts into temperature bucket probabilities.
+"""Probability engine: converts multi-model ensemble forecasts into temperature
+bucket probabilities using Kernel Density Estimation (KDE).
 
-Uses 31-member GFS ensemble for empirical probability estimation instead of
-assuming a normal distribution. Falls back to normal distribution if ensemble
-data is unavailable.
+Research-backed approach:
+- KDE instead of raw counting (fixes ensemble underdispersion)
+- Silverman bandwidth with spread-inflation factor
+- Supports multi-model ensembles (ECMWF + GFS + ICON = 120+ members)
+- Falls back to normal distribution if ensemble unavailable
+
+References:
+- Gneiting et al. (2005), Monthly Weather Review — EMOS calibration
+- Hamill (2001), MWR — ensemble reliability/underdispersion
 """
 
 import logging
+import math
 from dataclasses import dataclass
 
 from scipy.stats import norm
@@ -34,13 +42,18 @@ def ensemble_bucket_probability(
     bucket_low: float,
     bucket_high: float,
 ) -> float:
-    """Calculate bucket probability from GFS ensemble members.
+    """Calculate bucket probability using Kernel Density Estimation.
 
-    Counts how many of the 31 ensemble members fall within the bucket range.
-    This is empirical probability — no distributional assumptions.
+    Places a Gaussian kernel at each ensemble member and integrates
+    over the bucket range. This corrects for ensemble underdispersion
+    (raw ensembles are overconfident — observations fall outside the
+    ensemble range 15-25% of the time, not the expected 6%).
+
+    The bandwidth is Silverman's rule * 1.2 spread-inflation factor
+    to account for known NWP underdispersion.
 
     Args:
-        ensemble_members: List of 31 temperature forecasts in °C.
+        ensemble_members: Temperature forecasts from one or more models (°C).
         bucket_low: Lower bound of temperature bucket.
         bucket_high: Upper bound of temperature bucket.
 
@@ -50,14 +63,30 @@ def ensemble_bucket_probability(
     if not ensemble_members:
         return 0.0
 
-    count = sum(1 for t in ensemble_members if bucket_low <= t < bucket_high)
-    prob = count / len(ensemble_members)
+    n = len(ensemble_members)
+    mean = sum(ensemble_members) / n
+    variance = sum((t - mean) ** 2 for t in ensemble_members) / n
+    std = math.sqrt(variance) if variance > 0 else 1.0
 
-    # Apply Laplace smoothing to avoid 0% or 100% probabilities
-    # (with 31 members, raw 0/31 = 0% is too aggressive)
-    smoothed = (count + 0.5) / (len(ensemble_members) + 1)
+    # Silverman's rule of thumb: h = 1.06 * sigma * N^(-1/5)
+    # With 1.2x inflation factor for ensemble underdispersion
+    spread_inflation = 1.2
+    bandwidth = 1.06 * std * (n ** -0.2) * spread_inflation
 
-    return smoothed
+    # Minimum bandwidth to avoid delta-function spikes
+    bandwidth = max(bandwidth, 0.3)
+
+    # KDE probability: average of each member's contribution to the bucket
+    # P(bucket) = (1/N) * sum_i [Phi((high - member_i) / h) - Phi((low - member_i) / h)]
+    prob = 0.0
+    for member in ensemble_members:
+        p_high = norm.cdf(bucket_high, loc=member, scale=bandwidth)
+        p_low = norm.cdf(bucket_low, loc=member, scale=bandwidth)
+        prob += (p_high - p_low)
+
+    prob /= n
+
+    return max(0.001, min(0.999, prob))
 
 
 def bucket_probability(
@@ -81,6 +110,7 @@ def kelly_criterion(prob: float, market_price: float, fraction: float = None) ->
     """Calculate Kelly criterion bet size as fraction of bankroll.
 
     Uses fractional Kelly (default quarter-Kelly) for conservative sizing.
+    Research recommends 0.15-0.25 for small bankrolls with uncertain edge.
     """
     if fraction is None:
         fraction = CONFIG["kelly_fraction"]
@@ -106,7 +136,7 @@ def find_signals(
 ) -> list[BucketSignal]:
     """Find tradeable signals by comparing model probs vs market prices.
 
-    Uses ensemble-based probability if ensemble_members is provided,
+    Uses KDE-based ensemble probability if ensemble_members is provided,
     otherwise falls back to normal distribution.
 
     Args:
@@ -115,7 +145,8 @@ def find_signals(
         market_buckets: List of dicts with keys:
             bucket_low, bucket_high, market_price, market_id, token_id
         bankroll: Current bankroll for sizing.
-        ensemble_members: Optional list of 31 GFS ensemble temperature values.
+        ensemble_members: Optional list of ensemble temperature values
+            (can be 31 GFS, 51 ECMWF, or 120+ multi-model).
 
     Returns:
         List of BucketSignal objects where edge >= entry_threshold.
@@ -124,7 +155,7 @@ def find_signals(
         bankroll = CONFIG["bankroll"]
 
     use_ensemble = ensemble_members and len(ensemble_members) >= 10
-    method = "ensemble" if use_ensemble else "normal"
+    method = f"KDE-{len(ensemble_members)}m" if use_ensemble else "normal"
 
     signals = []
     for bucket in market_buckets:

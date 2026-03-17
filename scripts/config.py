@@ -10,22 +10,21 @@ CONFIG = {
     "entry_threshold": 0.08,       # Min 8% edge to enter
     "exit_threshold": 0.45,        # Sell when bucket price > 45c
     "max_position_usd": 2.00,      # Max $2 per bucket
-    "max_open_positions": 5,       # Max 5 concurrent positions
-    "max_exposure_pct": 0.30,      # Max 30% of bankroll at risk
+    "max_open_positions": 15,      # Max 15 concurrent (laddering across buckets)
+    "max_exposure_pct": 0.40,      # Max 40% of bankroll at risk
     "daily_loss_limit": -5.00,     # Auto-pause if -$5 on the day
-    "kelly_fraction": 0.25,        # Quarter-Kelly sizing
-    "scan_interval_min": 30,       # Scan every 30 minutes
-    "min_hours_to_resolution": 6,  # Don't trade < 6hrs before resolution
+    "kelly_fraction": 0.20,        # 20% Kelly — conservative for $50 bankroll
+    "scan_interval_min": 5,        # Scan every 5 min (catch forecast updates fast)
+    "min_hours_to_resolution": 2,  # Trade up to 2hrs before resolution
     "sigma_c": 1.1,                # Forecast uncertainty (°C) — ~2°F
     "bankroll": 43.00,             # Starting trading capital in USDC
     "heartbeat_interval": 10,      # Seconds between heartbeats
     # --- Advanced Risk Checks ---
-    "max_spread": 0.15,             # Skip markets with bid-ask spread > 15%
+    "max_spread": 0.15,            # Skip markets with bid-ask spread > 15%
     "min_liquidity_usd": 50.0,     # Skip markets with < $50 orderbook depth
-    "min_hours_to_resolution": 6,  # Don't trade < 6hrs before resolution (override above)
     "max_drawdown_pct": 0.25,      # Auto-kill if bankroll drops 25% from peak
     "max_consecutive_losses": 5,   # Pause after 5 straight losses
-    "max_daily_trades": 20,        # Max trades per day
+    "max_daily_trades": 30,        # Max trades per day (higher for laddering)
     "cf_max_retries": 3,           # Cloudflare retry attempts
     "cf_base_delay": 2.0,          # Base delay for exponential backoff (seconds)
 }

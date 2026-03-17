@@ -1,5 +1,10 @@
 """Weather forecast client: NOAA for US cities, Open-Meteo for international.
-Supports GFS 31-member ensemble for probability estimation."""
+Supports multi-model ensemble (ECMWF + GFS + ICON) for probability estimation.
+
+Research shows multi-model ensembles consistently outperform single-model
+because they sample model structural uncertainty (Gneiting et al., 2005).
+ECMWF is #1 globally; combining with GFS and ICON gives 120+ members.
+"""
 
 import logging
 import time
@@ -14,10 +19,18 @@ logger = logging.getLogger(__name__)
 
 ENSEMBLE_API_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
+# Models to fetch, in priority order. ECMWF IFS (51 members) is best,
+# GFS (31 members) and ICON (40 members) add diversity.
+ENSEMBLE_MODELS = [
+    {"name": "ecmwf_ifs025", "param": "ecmwf_ifs025", "members": 51},
+    {"name": "gfs025", "param": "gfs_seamless", "members": 31},
+    {"name": "icon_global", "param": "icon_seamless", "members": 40},
+]
+
 
 class WeatherClient:
     """Fetches temperature forecasts from NOAA (US) or Open-Meteo (worldwide).
-    Also provides GFS ensemble data for probability estimation."""
+    Also provides multi-model ensemble data for probability estimation."""
 
     def __init__(self):
         self.session = requests.Session()
@@ -114,21 +127,12 @@ class WeatherClient:
             logger.error(f"Open-Meteo fetch failed for {city}: {e}")
             return None
 
-    # --- GFS 31-member Ensemble ---
+    # --- Multi-Model Ensemble (ECMWF + GFS + ICON) ---
 
-    def get_ensemble_highs(self, city: str, target_date: Optional[str] = None) -> Optional[list[float]]:
-        """Get GFS 31-member ensemble high temperature forecasts in °C.
-
-        Returns list of 31 temperature values (one per ensemble member),
-        or None on failure. This is the core data for probability estimation.
-        """
-        if target_date is None:
-            target_date = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
-
-        city_info = CITIES.get(city)
-        if not city_info:
-            return None
-
+    def _fetch_single_model_ensemble(
+        self, city_info: dict, model_param: str, target_date: str
+    ) -> list[float]:
+        """Fetch ensemble members for a single model. Returns list of temps."""
         try:
             resp = self.session.get(
                 ENSEMBLE_API_URL,
@@ -136,11 +140,11 @@ class WeatherClient:
                     "latitude": city_info["lat"],
                     "longitude": city_info["lon"],
                     "daily": "temperature_2m_max",
-                    "models": "gfs_seamless",
+                    "models": model_param,
                     "timezone": "auto",
                     "forecast_days": 3,
                 },
-                timeout=15,
+                timeout=20,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -155,8 +159,7 @@ class WeatherClient:
                     break
 
             if date_idx is None:
-                logger.warning(f"No ensemble data for {city} on {target_date}")
-                return None
+                return []
 
             # Collect all ensemble member values for this date
             members = []
@@ -166,27 +169,58 @@ class WeatherClient:
             if control and date_idx < len(control) and control[date_idx] is not None:
                 members.append(control[date_idx])
 
-            # Members 01-30
-            for m in range(1, 31):
+            # Perturbation members (up to 50 for ECMWF, 30 for GFS, 39 for ICON)
+            for m in range(1, 51):
                 key = f"temperature_2m_max_member{m:02d}"
                 vals = daily.get(key)
                 if vals and date_idx < len(vals) and vals[date_idx] is not None:
                     members.append(vals[date_idx])
 
-            if len(members) < 10:
-                logger.warning(f"Only {len(members)} ensemble members for {city}")
-                return None
-
-            logger.info(
-                f"{city} ensemble ({len(members)} members) for {target_date}: "
-                f"mean={sum(members)/len(members):.1f}°C "
-                f"spread={max(members)-min(members):.1f}°C"
-            )
             return members
 
         except Exception as e:
-            logger.error(f"Ensemble fetch failed for {city}: {e}")
+            logger.warning(f"Ensemble fetch failed for {model_param}: {e}")
+            return []
+
+    def get_ensemble_highs(self, city: str, target_date: Optional[str] = None) -> Optional[list[float]]:
+        """Get multi-model ensemble high temperature forecasts in °C.
+
+        Fetches ECMWF (51 members) + GFS (31 members) + ICON (40 members)
+        and pools them into a single 120+ member super-ensemble.
+        Falls back to fewer models if some fail.
+
+        Returns list of temperature values, or None on failure.
+        """
+        if target_date is None:
+            target_date = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+
+        city_info = CITIES.get(city)
+        if not city_info:
             return None
+
+        all_members = []
+        models_used = []
+
+        for model in ENSEMBLE_MODELS:
+            members = self._fetch_single_model_ensemble(
+                city_info, model["param"], target_date
+            )
+            if members:
+                all_members.extend(members)
+                models_used.append(f"{model['name']}({len(members)})")
+            time.sleep(0.2)  # Rate limiting
+
+        if len(all_members) < 10:
+            logger.warning(f"Only {len(all_members)} total ensemble members for {city}")
+            return None
+
+        logger.info(
+            f"{city} multi-model ensemble for {target_date}: "
+            f"{len(all_members)} members [{', '.join(models_used)}] | "
+            f"mean={sum(all_members)/len(all_members):.1f}°C "
+            f"spread={max(all_members)-min(all_members):.1f}°C"
+        )
+        return all_members
 
     # --- Public API ---
 
