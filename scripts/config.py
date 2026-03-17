@@ -17,7 +17,7 @@ CONFIG = {
     "scan_interval_min": 5,        # Scan every 5 min (catch forecast updates fast)
     "min_hours_to_resolution": 2,  # Trade up to 2hrs before resolution
     "sigma_c": 1.1,                # Forecast uncertainty (°C) — ~2°F
-    "bankroll": 43.00,             # Starting trading capital in USDC
+    "bankroll": 50.00,             # Starting trading capital in USDC
     "heartbeat_interval": 10,      # Seconds between heartbeats
     # --- Advanced Risk Checks ---
     "max_spread": 0.15,            # Skip markets with bid-ask spread > 15%
