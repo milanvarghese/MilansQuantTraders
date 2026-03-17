@@ -1,12 +1,12 @@
-"""Web dashboard for monitoring the Polymarket weather trading bot.
+"""Web dashboard for monitoring Polymarket paper trading.
 
 Features:
 - Real-time P&L chart (bankroll over time)
 - Edge distribution histogram
 - Win rate gauge
-- City performance breakdown
-- Paper trade history with sorting
-- Ensemble model status
+- Category performance breakdown
+- Open positions with unrealized P&L
+- Trade history with sorting
 - Live activity log
 """
 
@@ -22,9 +22,10 @@ from flask import Flask, render_template_string, request, Response, jsonify
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RISK_STATE = os.path.join(BASE_DIR, "logs", "risk_state.json")
-TRADES_LOG = os.path.join(BASE_DIR, "logs", "trades.log")
-PAPER_LOG = os.path.join(BASE_DIR, "logs", "paper_trades.csv")
+PAPER_DIR = os.path.join(BASE_DIR, "paper_trading")
+PAPER_STATE = os.path.join(PAPER_DIR, "state.json")
+PAPER_TRADES = os.path.join(PAPER_DIR, "trades.csv")
+PAPER_LOG_FILE = os.path.join(PAPER_DIR, "paper_trading.log")
 
 # Auth
 DASH_USER = os.getenv("DASH_USER", "admin")
@@ -51,22 +52,22 @@ def auth_required(f):
     return decorated
 
 
-def load_risk_state():
-    if os.path.exists(RISK_STATE):
-        with open(RISK_STATE) as f:
+def load_paper_state():
+    if os.path.exists(PAPER_STATE):
+        with open(PAPER_STATE) as f:
             return json.load(f)
     return {
-        "bankroll": 43.0, "peak_bankroll": 43.0, "open_positions": [],
-        "daily_pnl": 0, "total_pnl": 0, "total_trades": 0,
-        "winning_trades": 0, "consecutive_losses": 0, "daily_trade_count": 0,
-        "is_paused": False, "pause_reason": "",
+        "bankroll": 50.0, "starting_bankroll": 50.0, "peak_bankroll": 50.0,
+        "positions": [], "closed_trades": [], "total_trades": 0,
+        "winning_trades": 0, "total_pnl": 0.0, "daily_pnl": 0.0,
+        "daily_trade_count": 0, "last_scan": "",
     }
 
 
-def load_paper_trades():
+def load_trade_log():
     trades = []
-    if os.path.exists(PAPER_LOG):
-        with open(PAPER_LOG) as f:
+    if os.path.exists(PAPER_TRADES):
+        with open(PAPER_TRADES) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 trades.append(row)
@@ -75,61 +76,61 @@ def load_paper_trades():
 
 def load_recent_logs(n=50):
     lines = []
-    if os.path.exists(TRADES_LOG):
-        with open(TRADES_LOG) as f:
+    if os.path.exists(PAPER_LOG_FILE):
+        with open(PAPER_LOG_FILE) as f:
             lines = f.readlines()
     return lines[-n:]
 
 
-def compute_analytics(paper_trades):
-    """Compute chart data and analytics from paper trades."""
-    # P&L timeline (cumulative simulated P&L)
+def compute_analytics(state, trades):
+    """Compute chart data and analytics from paper state and trades."""
+    # P&L timeline from trade log (cumulative realized P&L)
     pnl_timeline = []
     cumulative = 0.0
-    for t in paper_trades:
+    for t in trades:
         try:
-            edge = float(t.get("edge", 0))
-            size = float(t.get("kelly_size", 0))
-            # Simulated P&L: edge * size (expected value per trade)
-            simulated_pnl = edge * size
-            cumulative += simulated_pnl
-            ts = t.get("timestamp", "")[:16]
-            pnl_timeline.append({"time": ts, "pnl": round(cumulative, 2)})
+            pnl = float(t.get("pnl", 0))
+            if pnl != 0:
+                cumulative += pnl
+                ts = t.get("timestamp", "")[:16]
+                pnl_timeline.append({"time": ts, "pnl": round(cumulative, 2)})
         except (ValueError, TypeError):
             pass
 
     # Edge distribution (for histogram)
     edges = []
-    for t in paper_trades:
+    for t in trades:
         try:
-            edges.append(round(float(t.get("edge", 0)) * 100, 1))
+            edge = float(t.get("edge", 0))
+            if edge > 0:
+                edges.append(round(edge * 100, 1))
         except (ValueError, TypeError):
             pass
 
-    # City breakdown
-    city_stats = defaultdict(lambda: {"count": 0, "total_edge": 0.0, "total_size": 0.0})
-    for t in paper_trades:
-        city = t.get("city", "Unknown")
+    # Category breakdown (replaces city breakdown)
+    cat_stats = defaultdict(lambda: {"count": 0, "total_edge": 0.0, "total_size": 0.0})
+    for t in trades:
+        cat = t.get("category", "Unknown") or "Unknown"
         try:
-            city_stats[city]["count"] += 1
-            city_stats[city]["total_edge"] += float(t.get("edge", 0))
-            city_stats[city]["total_size"] += float(t.get("kelly_size", 0))
+            cat_stats[cat]["count"] += 1
+            cat_stats[cat]["total_edge"] += abs(float(t.get("edge", 0)))
+            cat_stats[cat]["total_size"] += float(t.get("cost_usd", 0))
         except (ValueError, TypeError):
             pass
 
-    city_data = []
-    for city, stats in sorted(city_stats.items(), key=lambda x: -x[1]["count"]):
+    cat_data = []
+    for cat, stats in sorted(cat_stats.items(), key=lambda x: -x[1]["count"]):
         avg_edge = (stats["total_edge"] / stats["count"] * 100) if stats["count"] > 0 else 0
-        city_data.append({
-            "city": city,
+        cat_data.append({
+            "category": cat,
             "trades": stats["count"],
             "avg_edge": round(avg_edge, 1),
             "total_size": round(stats["total_size"], 2),
         })
 
-    # Hourly distribution (when do signals appear?)
+    # Hourly distribution
     hour_counts = defaultdict(int)
-    for t in paper_trades:
+    for t in trades:
         try:
             ts = t.get("timestamp", "")
             if ts:
@@ -142,7 +143,7 @@ def compute_analytics(paper_trades):
     return {
         "pnl_timeline": pnl_timeline,
         "edges": edges,
-        "city_data": city_data,
+        "cat_data": cat_data,
         "hourly": hourly,
     }
 
@@ -152,7 +153,7 @@ TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Polymarket Weather Bot</title>
+<title>Polymarket Paper Trading</title>
 <meta http-equiv="refresh" content="30">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
@@ -194,8 +195,7 @@ TEMPLATE = """<!DOCTYPE html>
   tr:hover { background: #1c2333; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.7em; font-weight: 600; }
   .badge-active { background: #0d2818; color: #3fb950; border: 1px solid #238636; }
-  .badge-paused { background: #2d1b00; color: #d29922; border: 1px solid #9e6a03; }
-  .badge-loss { background: #2d0000; color: #f85149; border: 1px solid #da3633; }
+  .badge-paper { background: #1c1d5e; color: #a5b4fc; border: 1px solid #6366f1; }
 
   .log-box { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 10px 12px; font-size: 0.68em; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.7; font-family: 'JetBrains Mono', 'Fira Code', monospace; color: #8b949e; }
   .empty { color: #484f58; font-style: italic; padding: 20px; text-align: center; }
@@ -209,14 +209,13 @@ TEMPLATE = """<!DOCTYPE html>
 <body>
 
 <div class="topbar">
-  <h1>POLYMARKET WEATHER BOT</h1>
+  <h1>POLYMARKET PAPER TRADER</h1>
   <div class="meta">
-    {% if state.is_paused %}
-      <span class="badge badge-paused">PAUSED: {{ state.pause_reason }}</span>
-    {% else %}
-      <span class="badge badge-active">SCANNING LIVE</span>
-    {% endif %}
+    <span class="badge badge-paper">PAPER TRADING</span>
     &nbsp;&middot;&nbsp; {{ now }} &nbsp;&middot;&nbsp; refreshes every 30s
+    {% if state.last_scan %}
+    &nbsp;&middot;&nbsp; last scan: {{ state.last_scan[:19] }}
+    {% endif %}
   </div>
 </div>
 
@@ -229,8 +228,12 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="val g">${{ "%.2f"|format(state.bankroll) }}</div>
   </div>
   <div class="stat">
+    <div class="label">Starting</div>
+    <div class="val n">${{ "%.2f"|format(state.starting_bankroll) }}</div>
+  </div>
+  <div class="stat">
     <div class="label">Peak</div>
-    <div class="val b">${{ "%.2f"|format(state.get('peak_bankroll', state.bankroll)) }}</div>
+    <div class="val b">${{ "%.2f"|format(state.peak_bankroll) }}</div>
   </div>
   <div class="stat">
     <div class="label">Total P&L</div>
@@ -239,6 +242,10 @@ TEMPLATE = """<!DOCTYPE html>
   <div class="stat">
     <div class="label">Daily P&L</div>
     <div class="val {{ 'g' if state.daily_pnl >= 0 else 'r' }}">${{ "%+.2f"|format(state.daily_pnl) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Unrealized</div>
+    <div class="val {{ 'g' if unrealized >= 0 else 'r' }}">${{ "%+.2f"|format(unrealized) }}</div>
   </div>
   <div class="stat">
     <div class="label">Win Rate</div>
@@ -250,11 +257,11 @@ TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="stat">
     <div class="label">Open / Exposure</div>
-    <div class="val n">{{ state.open_positions|length }} / ${{ "%.2f"|format(exposure) }}</div>
+    <div class="val n">{{ positions|length }} / ${{ "%.2f"|format(exposure) }}</div>
   </div>
   <div class="stat">
-    <div class="label">Loss Streak</div>
-    <div class="val {{ 'r' if state.get('consecutive_losses',0) >= 3 else 'n' }}">{{ state.get('consecutive_losses', 0) }}</div>
+    <div class="label">ROI</div>
+    <div class="val {{ 'g' if roi >= 0 else 'r' }}">{{ "%+.1f"|format(roi) }}%</div>
   </div>
   <div class="stat">
     <div class="label">Drawdown</div>
@@ -265,7 +272,7 @@ TEMPLATE = """<!DOCTYPE html>
 <!-- Charts Row 1: P&L + Edge Distribution -->
 <div class="charts">
   <div class="chart-card">
-    <h3>Cumulative Expected P&L (Paper)</h3>
+    <h3>Realized P&L Over Time</h3>
     <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
   </div>
   <div class="chart-card">
@@ -274,27 +281,27 @@ TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Charts Row 2: City Performance + Hourly Activity -->
+<!-- Charts Row 2: Category Performance + Hourly Activity -->
 <div class="row2">
   <div class="chart-card">
-    <h3>Signals by City</h3>
-    <div class="chart-wrap"><canvas id="cityChart"></canvas></div>
+    <h3>Trades by Category</h3>
+    <div class="chart-wrap"><canvas id="catChart"></canvas></div>
   </div>
   <div class="chart-card">
-    <h3>Signal Activity by Hour (UTC)</h3>
+    <h3>Trade Activity by Hour (UTC)</h3>
     <div class="chart-wrap"><canvas id="hourChart"></canvas></div>
   </div>
 </div>
 
-<!-- City Performance Table -->
-{% if analytics.city_data %}
+<!-- Category Performance Table -->
+{% if analytics.cat_data %}
 <div class="section">
-  <h2>City Performance</h2>
+  <h2>Category Performance</h2>
   <table>
-    <tr><th>City</th><th>Signals</th><th>Avg Edge</th><th>Total Size</th></tr>
-    {% for c in analytics.city_data %}
+    <tr><th>Category</th><th>Trades</th><th>Avg Edge</th><th>Total Size</th></tr>
+    {% for c in analytics.cat_data %}
     <tr>
-      <td>{{ c.city }}</td>
+      <td>{{ c.category }}</td>
       <td>{{ c.trades }}</td>
       <td class="g">{{ c.avg_edge }}%</td>
       <td>${{ c.total_size }}</td>
@@ -305,45 +312,77 @@ TEMPLATE = """<!DOCTYPE html>
 {% endif %}
 
 <!-- Open Positions -->
-{% if state.open_positions %}
+{% if positions %}
 <div class="section">
-  <h2>Open Positions ({{ state.open_positions|length }})</h2>
+  <h2>Open Positions ({{ positions|length }})</h2>
   <table>
-    <tr><th>City</th><th>Bucket</th><th>Entry</th><th>Shares</th><th>Cost</th><th>Time</th></tr>
-    {% for p in state.open_positions %}
+    <tr><th>ID</th><th>Side</th><th>Market</th><th>Category</th><th>Entry</th><th>Current</th><th>Shares</th><th>Cost</th><th>P&L</th><th>Edge</th><th>Opened</th></tr>
+    {% for p in positions %}
     <tr>
-      <td>{{ p.city }}</td>
-      <td>{{ p.bucket }}</td>
-      <td>${{ "%.3f"|format(p.entry_price) }}</td>
-      <td>{{ "%.1f"|format(p.size_shares) }}</td>
+      <td>{{ p.id }}</td>
+      <td><span class="{{ 'g' if p.side == 'YES' else 'r' }}">{{ p.side }}</span></td>
+      <td>{{ p.market_question[:55] }}</td>
+      <td>{{ p.category }}</td>
+      <td>{{ "%.1f"|format(p.entry_price * 100) }}c</td>
+      <td>{{ "%.1f"|format(p.get('current_price', p.entry_price) * 100) }}c</td>
+      <td>{{ "%.1f"|format(p.shares) }}</td>
       <td>${{ "%.2f"|format(p.cost_usd) }}</td>
-      <td>{{ p.timestamp[:16] }}</td>
+      <td class="{{ 'g' if p.get('unrealized_pnl', 0) >= 0 else 'r' }}">${{ "%+.2f"|format(p.get('unrealized_pnl', 0)) }}</td>
+      <td class="g">{{ "%.1f"|format(p.edge_at_entry * 100) }}%</td>
+      <td>{{ p.opened_at[:16] }}</td>
     </tr>
     {% endfor %}
   </table>
 </div>
 {% endif %}
 
-<!-- Paper Trades -->
+<!-- Closed Trades -->
+{% if closed_trades %}
 <div class="section">
-  <h2>Paper Trades (Last 100)</h2>
-  {% if paper_trades %}
+  <h2>Closed Trades (Last 50 of {{ closed_trades|length }})</h2>
   <table>
-    <tr><th>Time</th><th>City</th><th>Bucket</th><th>Model</th><th>Market</th><th>Edge</th><th>Size</th></tr>
-    {% for t in paper_trades[-100:]|reverse %}
+    <tr><th>ID</th><th>Side</th><th>Market</th><th>Category</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th><th>Closed</th></tr>
+    {% for t in closed_trades[-50:]|reverse %}
     <tr>
-      <td>{{ t.timestamp[:16] if t.timestamp else '' }}</td>
-      <td>{{ t.city }}</td>
-      <td>{{ t.bucket_low }}-{{ t.bucket_high }}°C</td>
-      <td>{{ "%.1f"|format(t.model_prob|float * 100) }}%</td>
-      <td>{{ "%.1f"|format(t.market_price|float * 100) }}%</td>
-      <td class="g">+{{ "%.1f"|format(t.edge|float * 100) }}%</td>
-      <td>${{ t.kelly_size }}</td>
+      <td>{{ t.id }}</td>
+      <td><span class="{{ 'g' if t.side == 'YES' else 'r' }}">{{ t.side }}</span></td>
+      <td>{{ t.market_question[:55] }}</td>
+      <td>{{ t.category }}</td>
+      <td>{{ "%.1f"|format(t.entry_price * 100) }}c</td>
+      <td>{{ "%.1f"|format(t.exit_price * 100) }}c</td>
+      <td class="{{ 'g' if t.pnl >= 0 else 'r' }}">${{ "%+.2f"|format(t.pnl) }}</td>
+      <td>{{ t.reason }}</td>
+      <td>{{ t.closed_at[:16] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<!-- Trade Log (CSV) -->
+<div class="section">
+  <h2>Trade Log (Last 100)</h2>
+  {% if trade_log %}
+  <table>
+    <tr><th>Time</th><th>Action</th><th>Market</th><th>Category</th><th>Side</th><th>Price</th><th>Shares</th><th>Cost</th><th>P&L</th><th>Edge</th><th>Confidence</th></tr>
+    {% for t in trade_log[-100:]|reverse %}
+    <tr>
+      <td>{{ t.get('timestamp', '')[:16] }}</td>
+      <td><span class="{{ 'g' if t.action == 'OPEN' else 'y' }}">{{ t.action }}</span></td>
+      <td>{{ t.get('market_question', '')[:50] }}</td>
+      <td>{{ t.get('category', '') }}</td>
+      <td>{{ t.get('side', '') }}</td>
+      <td>{{ "%.1f"|format(t.get('price', '0')|float * 100) }}c</td>
+      <td>{{ t.get('shares', '') }}</td>
+      <td>${{ t.get('cost_usd', '0') }}</td>
+      <td class="{{ 'g' if t.get('pnl', '0')|float >= 0 else 'r' }}">${{ t.get('pnl', '0') }}</td>
+      <td class="g">{{ "%.1f"|format(t.get('edge', '0')|float * 100) }}%</td>
+      <td>{{ t.get('confidence', '') }}</td>
     </tr>
     {% endfor %}
   </table>
   {% else %}
-  <div class="empty">No paper trades yet — bot is scanning for weather markets</div>
+  <div class="empty">No trades yet -- run: cd scripts && python paper_trader.py --scan-once</div>
   {% endif %}
 </div>
 
@@ -371,8 +410,8 @@ if (pnlData.length > 0) {
       labels: pnlData.map(d => d.time),
       datasets: [{
         data: pnlData.map(d => d.pnl),
-        borderColor: '#3fb950',
-        backgroundColor: 'rgba(63,185,80,0.1)',
+        borderColor: pnlData[pnlData.length-1].pnl >= 0 ? '#3fb950' : '#f85149',
+        backgroundColor: pnlData[pnlData.length-1].pnl >= 0 ? 'rgba(63,185,80,0.1)' : 'rgba(248,81,73,0.1)',
         fill: true,
         tension: 0.3,
         pointRadius: 0,
@@ -422,17 +461,17 @@ if (edges.length > 0) {
   });
 }
 
-// City Chart
-const cityData = {{ city_data | tojson }};
-if (cityData.length > 0) {
+// Category Chart (replaces City chart)
+const catData = {{ cat_data | tojson }};
+if (catData.length > 0) {
   const colors = ['#3fb950','#58a6ff','#d29922','#f85149','#bc8cff','#39d2c0','#ff7b72','#79c0ff','#ffa657','#d2a8ff','#7ee787'];
-  new Chart(document.getElementById('cityChart'), {
+  new Chart(document.getElementById('catChart'), {
     type: 'doughnut',
     data: {
-      labels: cityData.map(c => c.city),
+      labels: catData.map(c => c.category),
       datasets: [{
-        data: cityData.map(c => c.trades),
-        backgroundColor: colors.slice(0, cityData.length),
+        data: catData.map(c => c.trades),
+        backgroundColor: colors.slice(0, catData.length),
         borderWidth: 0,
       }]
     },
@@ -473,31 +512,45 @@ new Chart(document.getElementById('hourChart'), {
 @app.route("/")
 @auth_required
 def index():
-    state = load_risk_state()
-    paper_trades = load_paper_trades()
+    state = load_paper_state()
+    trade_log = load_trade_log()
     logs = load_recent_logs()
+
+    positions = state.get("positions", [])
+    closed_trades = state.get("closed_trades", [])
+
     total = state.get("total_trades", 0)
     wins = state.get("winning_trades", 0)
     win_rate = (wins / total * 100) if total > 0 else 0
-    exposure = sum(p.get("cost_usd", 0) for p in state.get("open_positions", []))
-    peak = state.get("peak_bankroll", state.get("bankroll", 43.0))
-    drawdown = ((1 - state.get("bankroll", 43.0) / peak) * 100) if peak > 0 else 0
 
-    analytics = compute_analytics(paper_trades)
+    exposure = sum(p.get("cost_usd", 0) for p in positions)
+    unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+
+    starting = state.get("starting_bankroll", 50.0)
+    roi = ((state.get("total_pnl", 0) / starting) * 100) if starting > 0 else 0
+
+    peak = state.get("peak_bankroll", state.get("bankroll", 50.0))
+    drawdown = ((1 - state.get("bankroll", 50.0) / peak) * 100) if peak > 0 else 0
+
+    analytics = compute_analytics(state, trade_log)
 
     return render_template_string(
         TEMPLATE,
         state=state,
-        paper_trades=paper_trades,
+        positions=positions,
+        closed_trades=closed_trades,
+        trade_log=trade_log,
         logs=logs,
         win_rate=win_rate,
         exposure=exposure,
+        unrealized=unrealized,
+        roi=roi,
         drawdown=drawdown,
         now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         analytics=analytics,
         pnl_timeline=analytics["pnl_timeline"],
         edges=analytics["edges"],
-        city_data=analytics["city_data"],
+        cat_data=analytics["cat_data"],
         hourly=analytics["hourly"],
     )
 
@@ -505,19 +558,20 @@ def index():
 @app.route("/api/status")
 @auth_required
 def api_status():
-    return jsonify(load_risk_state())
+    return jsonify(load_paper_state())
 
 
 @app.route("/api/trades")
 @auth_required
 def api_trades():
-    return jsonify(load_paper_trades()[-200:])
+    return jsonify(load_trade_log()[-200:])
 
 
 @app.route("/api/analytics")
 @auth_required
 def api_analytics():
-    return jsonify(compute_analytics(load_paper_trades()))
+    state = load_paper_state()
+    return jsonify(compute_analytics(state, load_trade_log()))
 
 
 if __name__ == "__main__":
