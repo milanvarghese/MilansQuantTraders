@@ -19,6 +19,15 @@ CONFIG = {
     "sigma_c": 1.1,                # Forecast uncertainty (°C) — ~2°F
     "bankroll": 43.00,             # Starting trading capital in USDC
     "heartbeat_interval": 10,      # Seconds between heartbeats
+    # --- Advanced Risk Checks ---
+    "max_spread": 0.15,             # Skip markets with bid-ask spread > 15%
+    "min_liquidity_usd": 50.0,     # Skip markets with < $50 orderbook depth
+    "min_hours_to_resolution": 6,  # Don't trade < 6hrs before resolution (override above)
+    "max_drawdown_pct": 0.25,      # Auto-kill if bankroll drops 25% from peak
+    "max_consecutive_losses": 5,   # Pause after 5 straight losses
+    "max_daily_trades": 20,        # Max trades per day
+    "cf_max_retries": 3,           # Cloudflare retry attempts
+    "cf_base_delay": 2.0,          # Base delay for exponential backoff (seconds)
 }
 
 # === City Configurations ===

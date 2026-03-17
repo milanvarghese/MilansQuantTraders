@@ -1,4 +1,5 @@
-"""Weather forecast client: NOAA for US cities, Open-Meteo for international."""
+"""Weather forecast client: NOAA for US cities, Open-Meteo for international.
+Supports GFS 31-member ensemble for probability estimation."""
 
 import logging
 import time
@@ -11,9 +12,12 @@ from config import NOAA_BASE_URL, NOAA_USER_AGENT, OPENMETEO_URL, CITIES, PROXIE
 
 logger = logging.getLogger(__name__)
 
+ENSEMBLE_API_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+
 
 class WeatherClient:
-    """Fetches temperature forecasts from NOAA (US) or Open-Meteo (worldwide)."""
+    """Fetches temperature forecasts from NOAA (US) or Open-Meteo (worldwide).
+    Also provides GFS ensemble data for probability estimation."""
 
     def __init__(self):
         self.session = requests.Session()
@@ -75,7 +79,7 @@ class WeatherClient:
         self._grid_cache.pop(city, None)
         return None
 
-    # --- Open-Meteo (worldwide) ---
+    # --- Open-Meteo (worldwide, single forecast) ---
 
     def _get_openmeteo_high(self, city: str, target_date: str) -> Optional[float]:
         """Get Open-Meteo forecast high in °C for any city."""
@@ -108,6 +112,80 @@ class WeatherClient:
             return None
         except Exception as e:
             logger.error(f"Open-Meteo fetch failed for {city}: {e}")
+            return None
+
+    # --- GFS 31-member Ensemble ---
+
+    def get_ensemble_highs(self, city: str, target_date: Optional[str] = None) -> Optional[list[float]]:
+        """Get GFS 31-member ensemble high temperature forecasts in °C.
+
+        Returns list of 31 temperature values (one per ensemble member),
+        or None on failure. This is the core data for probability estimation.
+        """
+        if target_date is None:
+            target_date = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+
+        city_info = CITIES.get(city)
+        if not city_info:
+            return None
+
+        try:
+            resp = self.session.get(
+                ENSEMBLE_API_URL,
+                params={
+                    "latitude": city_info["lat"],
+                    "longitude": city_info["lon"],
+                    "daily": "temperature_2m_max",
+                    "models": "gfs_seamless",
+                    "timezone": "auto",
+                    "forecast_days": 3,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            daily = data.get("daily", {})
+            dates = daily.get("time", [])
+
+            # Find target date index
+            date_idx = None
+            for i, d in enumerate(dates):
+                if d == target_date:
+                    date_idx = i
+                    break
+
+            if date_idx is None:
+                logger.warning(f"No ensemble data for {city} on {target_date}")
+                return None
+
+            # Collect all ensemble member values for this date
+            members = []
+
+            # Control run
+            control = daily.get("temperature_2m_max")
+            if control and date_idx < len(control) and control[date_idx] is not None:
+                members.append(control[date_idx])
+
+            # Members 01-30
+            for m in range(1, 31):
+                key = f"temperature_2m_max_member{m:02d}"
+                vals = daily.get(key)
+                if vals and date_idx < len(vals) and vals[date_idx] is not None:
+                    members.append(vals[date_idx])
+
+            if len(members) < 10:
+                logger.warning(f"Only {len(members)} ensemble members for {city}")
+                return None
+
+            logger.info(
+                f"{city} ensemble ({len(members)} members) for {target_date}: "
+                f"mean={sum(members)/len(members):.1f}°C "
+                f"spread={max(members)-min(members):.1f}°C"
+            )
+            return members
+
+        except Exception as e:
+            logger.error(f"Ensemble fetch failed for {city}: {e}")
             return None
 
     # --- Public API ---

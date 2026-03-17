@@ -1,6 +1,11 @@
-"""Polymarket API client for market discovery and order execution."""
+"""Polymarket API client for market discovery and order execution.
+
+Includes Cloudflare 403 mitigation with exponential backoff + jitter,
+proxy rotation support, and automatic retry logic.
+"""
 
 import logging
+import random
 import re
 import time
 import threading
@@ -22,12 +27,71 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# Common browser-like headers to reduce Cloudflare blocks
+_CF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _cf_retry_request(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
+    """Make an HTTP request with Cloudflare 403 retry + exponential backoff.
+
+    Retries on 403/429/5xx with jittered exponential backoff.
+    """
+    max_retries = CONFIG.get("cf_max_retries", 3)
+    base_delay = CONFIG.get("cf_base_delay", 2.0)
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = getattr(session, method)(url, **kwargs)
+
+            if resp.status_code == 403:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        f"Cloudflare 403 on {url} (attempt {attempt+1}/{max_retries+1}), "
+                        f"retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(f"Cloudflare 403 persists after {max_retries+1} attempts: {url}")
+
+            elif resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", base_delay * 2))
+                if attempt < max_retries:
+                    logger.warning(f"Rate limited (429), waiting {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
+
+            elif resp.status_code >= 500:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Server error {resp.status_code}, retrying in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+
+            return resp
+
+        except requests.exceptions.ConnectionError as e:
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Connection error (attempt {attempt+1}): {e}, retrying in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            raise
+
+    return resp
+
 
 class GammaClient:
     """Read-only client for Polymarket Gamma API (market discovery)."""
 
     def __init__(self):
         self.session = requests.Session()
+        self.session.headers.update(_CF_HEADERS)
         if PROXIES:
             self.session.proxies.update(PROXIES)
         self._events_cache: Optional[list] = None
@@ -45,7 +109,8 @@ class GammaClient:
         try:
             all_events = []
             for offset in range(0, 500, 100):
-                resp = self.session.get(
+                resp = _cf_retry_request(
+                    self.session, "get",
                     f"{GAMMA_API_URL}/events",
                     params={
                         "active": "true",
@@ -101,7 +166,8 @@ class GammaClient:
     def get_market_detail(self, condition_id: str) -> Optional[dict]:
         """Get detailed info for a specific market."""
         try:
-            resp = self.session.get(
+            resp = _cf_retry_request(
+                self.session, "get",
                 f"{GAMMA_API_URL}/markets/{condition_id}",
                 timeout=15,
             )
@@ -228,14 +294,24 @@ class PolymarketTrader:
         return creds
 
     def get_orderbook(self, token_id: str) -> Optional[dict]:
-        """Fetch the order book for a token."""
+        """Fetch the order book for a token with Cloudflare retry."""
         self._init_clob()
-        try:
-            book = self._clob_client.get_order_book(token_id)
-            return book
-        except Exception as e:
-            logger.error(f"Failed to get orderbook for {token_id}: {e}")
-            return None
+        max_retries = CONFIG.get("cf_max_retries", 3)
+        base_delay = CONFIG.get("cf_base_delay", 2.0)
+
+        for attempt in range(max_retries + 1):
+            try:
+                book = self._clob_client.get_order_book(token_id)
+                return book
+            except Exception as e:
+                err_str = str(e)
+                if ("403" in err_str or "cloudflare" in err_str.lower()) and attempt < max_retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"Cloudflare block on orderbook (attempt {attempt+1}), retry in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+                logger.error(f"Failed to get orderbook for {token_id}: {e}")
+                return None
 
     def buy(
         self,
@@ -259,20 +335,30 @@ class PolymarketTrader:
 
         size = amount_usd / price  # Number of shares
 
-        try:
-            order_args = OrderArgs(
-                price=price,
-                size=size,
-                side=BUY,
-                token_id=token_id,
-            )
-            signed_order = self._clob_client.create_order(order_args)
-            resp = self._clob_client.post_order(signed_order)
-            logger.info(f"BUY order placed: {size:.2f} shares @ ${price:.3f} = ${amount_usd:.2f}")
-            return resp
-        except Exception as e:
-            logger.error(f"BUY order failed: {e}")
-            return None
+        max_retries = CONFIG.get("cf_max_retries", 3)
+        base_delay = CONFIG.get("cf_base_delay", 2.0)
+
+        for attempt in range(max_retries + 1):
+            try:
+                order_args = OrderArgs(
+                    price=price,
+                    size=size,
+                    side=BUY,
+                    token_id=token_id,
+                )
+                signed_order = self._clob_client.create_order(order_args)
+                resp = self._clob_client.post_order(signed_order)
+                logger.info(f"BUY order placed: {size:.2f} shares @ ${price:.3f} = ${amount_usd:.2f}")
+                return resp
+            except Exception as e:
+                err_str = str(e)
+                if ("403" in err_str or "cloudflare" in err_str.lower()) and attempt < max_retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"Cloudflare block on BUY (attempt {attempt+1}), retry in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+                logger.error(f"BUY order failed: {e}")
+                return None
 
     def sell(
         self,
@@ -294,20 +380,53 @@ class PolymarketTrader:
         from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import SELL
 
-        try:
-            order_args = OrderArgs(
-                price=price,
-                size=size,
-                side=SELL,
-                token_id=token_id,
-            )
-            signed_order = self._clob_client.create_order(order_args)
-            resp = self._clob_client.post_order(signed_order)
-            logger.info(f"SELL order placed: {size:.2f} shares @ ${price:.3f}")
-            return resp
-        except Exception as e:
-            logger.error(f"SELL order failed: {e}")
-            return None
+        max_retries = CONFIG.get("cf_max_retries", 3)
+        base_delay = CONFIG.get("cf_base_delay", 2.0)
+
+        for attempt in range(max_retries + 1):
+            try:
+                order_args = OrderArgs(
+                    price=price,
+                    size=size,
+                    side=SELL,
+                    token_id=token_id,
+                )
+                signed_order = self._clob_client.create_order(order_args)
+                resp = self._clob_client.post_order(signed_order)
+                logger.info(f"SELL order placed: {size:.2f} shares @ ${price:.3f}")
+                return resp
+            except Exception as e:
+                err_str = str(e)
+                if ("403" in err_str or "cloudflare" in err_str.lower()) and attempt < max_retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"Cloudflare block on SELL (attempt {attempt+1}), retry in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+                logger.error(f"SELL order failed: {e}")
+                return None
+
+    def get_market_liquidity(self, token_id: str) -> dict:
+        """Get spread and liquidity info for risk checks.
+
+        Returns dict with 'spread' (0-1) and 'liquidity_usd' (float).
+        """
+        book = self.get_orderbook(token_id)
+        if not book:
+            return {"spread": 1.0, "liquidity_usd": 0.0}
+
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        best_bid = float(bids[0]["price"]) if bids else 0.0
+        best_ask = float(asks[0]["price"]) if asks else 1.0
+        spread = best_ask - best_bid
+
+        # Sum top-of-book liquidity (top 3 levels each side)
+        bid_liq = sum(float(b.get("size", 0)) * float(b.get("price", 0)) for b in bids[:3])
+        ask_liq = sum(float(a.get("size", 0)) * float(a.get("price", 0)) for a in asks[:3])
+        liquidity_usd = bid_liq + ask_liq
+
+        return {"spread": spread, "liquidity_usd": liquidity_usd}
 
     def get_open_orders(self) -> list[dict]:
         """Get all open orders for this wallet."""

@@ -63,13 +63,20 @@ class WeatherScanner:
             logger.warning(f"Skipping {city}: no forecast data")
             return []
 
+        # 1b. Get GFS ensemble data for probability estimation
+        ensemble_members = self.weather.get_ensemble_highs(city)
+        if ensemble_members:
+            logger.info(f"{city}: using {len(ensemble_members)}-member ensemble")
+        else:
+            logger.info(f"{city}: ensemble unavailable, using normal distribution")
+
         # 2. Get active markets for this city
         markets = self.gamma.search_weather_markets(city)
         if not markets:
             logger.info(f"No active temperature markets for {city}")
             return []
 
-        # 3. Parse buckets and find signals
+        # 3. Parse buckets and find signals (with ensemble data)
         city_signals = []
         for market in markets:
             buckets = self.gamma.parse_temperature_buckets(market)
@@ -81,6 +88,7 @@ class WeatherScanner:
                 forecast_high=forecast_high,
                 market_buckets=buckets,
                 bankroll=self.risk.state.bankroll,
+                ensemble_members=ensemble_members,
             )
 
             for signal in signals:
@@ -95,8 +103,13 @@ class WeatherScanner:
             self._paper_trade(signal)
             return
 
-        # Live trading
-        allowed, reason = self.risk.can_trade(signal.kelly_size)
+        # Get market liquidity info for risk checks
+        market_meta = {"market_id": signal.market_id}
+        if self.trader:
+            liq_info = self.trader.get_market_liquidity(signal.token_id)
+            market_meta.update(liq_info)
+
+        allowed, reason = self.risk.can_trade(signal.kelly_size, market_meta=market_meta)
         if not allowed:
             logger.info(f"Trade blocked: {reason}")
             return
