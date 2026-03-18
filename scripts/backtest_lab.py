@@ -230,6 +230,153 @@ def sweep_combined(pairs, days):
     return results
 
 
+def sweep_progressive_stop(pairs, days):
+    """Sweep progressive stop tightening parameters."""
+    print("\n" + "=" * 70)
+    print("  SWEEP: PROGRESSIVE STOP TIGHTENING")
+    print("=" * 70)
+
+    # Test 1: Progressive stop on/off
+    run_test("progressive_stop=OFF (baseline)", {"progressive_stop": False}, pairs=pairs, days=days)
+    run_test("progressive_stop=ON (default 50%/0.5x)", {"progressive_stop": True}, pairs=pairs, days=days)
+
+    # Test 2: Different start percentages
+    for start in [0.3, 0.4, 0.5, 0.6, 0.7]:
+        desc = f"prog_stop start={start:.0%} end=0.5x"
+        run_test(desc, {"progressive_stop": True, "progressive_stop_start_pct": start,
+                        "progressive_stop_end_mult": 0.5}, pairs=pairs, days=days)
+
+    # Test 3: Different end multipliers (how tight the final SL gets)
+    for end in [0.2, 0.3, 0.5, 0.7, 1.0]:
+        desc = f"prog_stop start=50% end={end}x"
+        run_test(desc, {"progressive_stop": True, "progressive_stop_start_pct": 0.5,
+                        "progressive_stop_end_mult": end}, pairs=pairs, days=days)
+
+    # Test 4: Progressive stop + time exit extension for losers
+    run_test("prog_stop + extend losers 6h",
+             {"progressive_stop": True, "time_exit_require_profit": True,
+              "time_exit_extension_hours": 6}, pairs=pairs, days=days)
+    run_test("prog_stop + extend losers 12h",
+             {"progressive_stop": True, "time_exit_require_profit": True,
+              "time_exit_extension_hours": 12}, pairs=pairs, days=days)
+
+
+def sweep_fees(pairs, days):
+    """Sweep fee tiers to understand fee sensitivity."""
+    print("\n" + "=" * 70)
+    print("  SWEEP: FEE SENSITIVITY")
+    print("=" * 70)
+
+    for fee in [0.0, 0.001, 0.002, 0.003, 0.004, 0.006, 0.008]:
+        label = {0.0: "zero", 0.001: "Binance VIP", 0.002: "Binance/Kraken",
+                 0.003: "CB Advanced", 0.004: "CB Active", 0.006: "CB Standard",
+                 0.008: "CB Default"}.get(fee, f"{fee:.3f}")
+        desc = f"fee={fee:.1%} ({label})"
+        run_test(desc, {"taker_fee_pct": fee, "maker_fee_pct": fee * 0.6}, pairs=pairs, days=days)
+
+
+def sweep_sl_tighter(pairs, days):
+    """Sweep tighter SL values — current 3.5x may be too wide, causing large losses."""
+    print("\n" + "=" * 70)
+    print("  SWEEP: TIGHTER STOP LOSSES (with current TP=4.0)")
+    print("=" * 70)
+
+    for sl in [1.0, 1.2, 1.5, 1.8, 2.0, 2.5, 3.0, 3.5]:
+        rr = 4.0 / sl
+        desc = f"TP=4.0 SL={sl} (R:R={rr:.1f})"
+        run_test(desc, {"sl_atr_mult": sl}, pairs=pairs, days=days)
+
+
+def sweep_pair_filter(pairs, days):
+    """Test with subsets of pairs — find optimal pair universe."""
+    print("\n" + "=" * 70)
+    print("  SWEEP: PAIR FILTERING")
+    print("=" * 70)
+
+    # All pairs baseline
+    run_test("ALL pairs", pairs=pairs, days=days)
+
+    # Remove worst performers (from baseline: DOT, AVAX, UNI, SUI)
+    bad_pairs = {"DOT", "AVAX", "UNI", "SUI"}
+    filtered = [p for p in pairs if p not in bad_pairs]
+    run_test("DROP DOT/AVAX/UNI/SUI", pairs=filtered, days=days)
+
+    # Only top performers (ATOM, LINK, DOGE, ETH, ADA, BTC)
+    top_pairs = [p for p in pairs if p in {"ATOM", "LINK", "DOGE", "ETH", "ADA", "BTC"}]
+    if top_pairs:
+        run_test("TOP 6 ONLY (ATOM/LINK/DOGE/ETH/ADA/BTC)", pairs=top_pairs, days=days)
+
+    # Large caps only
+    large = [p for p in pairs if p in {"BTC", "ETH", "SOL", "XRP", "DOGE", "ADA"}]
+    if large:
+        run_test("LARGE CAPS (BTC/ETH/SOL/XRP/DOGE/ADA)", pairs=large, days=days)
+
+    # Alts only (non BTC/ETH)
+    alts = [p for p in pairs if p not in {"BTC", "ETH"}]
+    if alts:
+        run_test("ALTS ONLY (no BTC/ETH)", pairs=alts, days=days)
+
+
+def sweep_v4_combos(pairs, days):
+    """Test promising v4 combinations: progressive stop + tighter SL + pair filter."""
+    print("\n" + "=" * 70)
+    print("  V4 OPTIMIZATION COMBOS")
+    print("=" * 70)
+
+    bad_pairs = {"DOT", "AVAX", "UNI", "SUI"}
+    filtered = [p for p in pairs if p not in bad_pairs]
+
+    combos = [
+        # Progressive stop variations with tighter SL
+        ("prog_stop + SL=2.0", filtered,
+         {"progressive_stop": True, "sl_atr_mult": 2.0}),
+        ("prog_stop + SL=2.5", filtered,
+         {"progressive_stop": True, "sl_atr_mult": 2.5}),
+        ("prog_stop + SL=1.5 + TP=3.5", filtered,
+         {"progressive_stop": True, "sl_atr_mult": 1.5, "tp_atr_mult": 3.5}),
+        # Tighter SL + delayed trailing (activate at 2.5x ATR profit)
+        ("SL=2.0 + trail=1.5 after 2.5x ATR", filtered,
+         {"sl_atr_mult": 2.0, "trailing_atr_mult": 1.5, "min_trail_activation_atr": 2.5}),
+        ("SL=2.5 + trail=2.0 after 2.0x ATR", filtered,
+         {"sl_atr_mult": 2.5, "trailing_atr_mult": 2.0, "min_trail_activation_atr": 2.0}),
+        # Higher confluence + tighter SL
+        ("score=7 + SL=2.0", filtered,
+         {"min_confluence_score": 7, "sl_atr_mult": 2.0}),
+        ("score=7 + SL=2.5 + TP=5.0", filtered,
+         {"min_confluence_score": 7, "sl_atr_mult": 2.5, "tp_atr_mult": 5.0}),
+        # Best combo: prog stop + tighter SL + pair filter + delayed trail
+        ("BEST: prog+SL=2.0+trail=1.5@2.5x+filtered", filtered,
+         {"progressive_stop": True, "sl_atr_mult": 2.0, "trailing_atr_mult": 1.5,
+          "min_trail_activation_atr": 2.5}),
+        ("BEST2: prog+SL=2.5+trail=2.0@2.0x+filtered", filtered,
+         {"progressive_stop": True, "sl_atr_mult": 2.5, "trailing_atr_mult": 2.0,
+          "min_trail_activation_atr": 2.0}),
+        # Binance fee tier versions of best combos
+        ("BINANCE: prog+SL=2.0+trail=1.5@2.5x", filtered,
+         {"progressive_stop": True, "sl_atr_mult": 2.0, "trailing_atr_mult": 1.5,
+          "min_trail_activation_atr": 2.5, "taker_fee_pct": 0.001, "maker_fee_pct": 0.001}),
+        ("BINANCE: SL=2.5+trail=2.0@2.0x", filtered,
+         {"sl_atr_mult": 2.5, "trailing_atr_mult": 2.0, "min_trail_activation_atr": 2.0,
+          "taker_fee_pct": 0.001, "maker_fee_pct": 0.001}),
+        ("BINANCE: baseline (current v3.2 config)", filtered,
+         {"taker_fee_pct": 0.001, "maker_fee_pct": 0.001}),
+    ]
+
+    results = []
+    for desc, test_pairs, overrides in combos:
+        result = run_test(desc, overrides, pairs=test_pairs, days=days)
+        wr = result.winning_trades / result.total_trades if result.total_trades > 0 else 0
+        results.append((desc, result.total_pnl, wr, result.profit_factor, result))
+
+    results.sort(key=lambda r: r[1], reverse=True)
+    print("\n--- V4 COMBOS RANKED BY PnL ---")
+    for i, (desc, pnl, wr, pf, _) in enumerate(results):
+        marker = " ***" if pf > 1.0 else ""
+        print(f"  {i+1}. {desc}: ${pnl:+.2f} PnL, {wr:.1%} WR, PF={pf:.2f}{marker}")
+
+    return results
+
+
 def print_history():
     """Print backtest history summary."""
     if not os.path.exists(HISTORY_FILE):
@@ -315,23 +462,34 @@ def main():
     pairs = [p.strip().upper() for p in args.pairs.split(",")] if args.pairs else None
 
     cmd = args.command.lower()
+    all_pairs = pairs or find_available_pairs()
 
     if cmd == "report":
         print_history()
     elif cmd == "baseline":
-        run_baseline(pairs or find_available_pairs(), args.days)
+        run_baseline(all_pairs, args.days)
     elif cmd == "sweep-tp-sl":
-        sweep_tp_sl(pairs or find_available_pairs(), args.days)
+        sweep_tp_sl(all_pairs, args.days)
     elif cmd == "sweep-confluence":
-        sweep_confluence(pairs or find_available_pairs(), args.days)
+        sweep_confluence(all_pairs, args.days)
     elif cmd == "sweep-regime":
-        sweep_regime(pairs or find_available_pairs(), args.days)
+        sweep_regime(all_pairs, args.days)
     elif cmd == "sweep-hold":
-        sweep_hold_time(pairs or find_available_pairs(), args.days)
+        sweep_hold_time(all_pairs, args.days)
     elif cmd == "sweep-combined":
-        sweep_combined(pairs or find_available_pairs(), args.days)
+        sweep_combined(all_pairs, args.days)
+    elif cmd == "sweep-progressive":
+        sweep_progressive_stop(all_pairs, args.days)
+    elif cmd == "sweep-fees":
+        sweep_fees(all_pairs, args.days)
+    elif cmd == "sweep-sl":
+        sweep_sl_tighter(all_pairs, args.days)
+    elif cmd == "sweep-pairs":
+        sweep_pair_filter(all_pairs, args.days)
+    elif cmd == "sweep-v4":
+        sweep_v4_combos(all_pairs, args.days)
     elif cmd == "sweep-all":
-        run_all_sweeps(pairs or find_available_pairs(), args.days)
+        run_all_sweeps(all_pairs, args.days)
     elif cmd == "custom":
         if len(args.args) < 1:
             print("Usage: custom 'description' key=val key2=val2")
@@ -345,11 +503,12 @@ def main():
                     overrides[k] = json.loads(v)
                 except json.JSONDecodeError:
                     overrides[k] = v
-        run_test(desc, overrides, pairs=pairs or find_available_pairs(), days=args.days)
+        run_test(desc, overrides, pairs=all_pairs, days=args.days)
     else:
         print(f"Unknown command: {cmd}")
         print("Commands: baseline, sweep-tp-sl, sweep-confluence, sweep-regime, "
-              "sweep-hold, sweep-combined, sweep-all, custom, report")
+              "sweep-hold, sweep-combined, sweep-progressive, sweep-fees, "
+              "sweep-sl, sweep-pairs, sweep-v4, sweep-all, custom, report")
 
 
 if __name__ == "__main__":

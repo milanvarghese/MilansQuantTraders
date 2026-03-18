@@ -683,9 +683,45 @@ class ScalperBacktester:
                     to_close.append((pos, "trailing_stop", pos.stop_loss, ts))
                     continue
 
-            # 5. TIME EXIT
+            # 5. PROGRESSIVE STOP TIGHTENING
+            # After X% of max hold time, gradually tighten SL toward entry price
+            # Converts losing time_exits into earlier SL exits (reduces drag)
             elapsed_h = (ts - pos.entry_time) / 3600
+            if self.config.get("progressive_stop", False):
+                max_hold = self.config["max_hold_hours"]
+                start_pct = self.config.get("progressive_stop_start_pct", 0.5)
+                end_mult = self.config.get("progressive_stop_end_mult", 0.5)
+                hold_pct = elapsed_h / max_hold if max_hold > 0 else 0
+
+                if hold_pct >= start_pct:
+                    # Linear interpolation: at start_pct use original SL, at 100% use tighter SL
+                    progress = min(1.0, (hold_pct - start_pct) / (1.0 - start_pct))
+                    original_sl_dist = atr * self.config["sl_atr_mult"]
+                    tight_sl_dist = atr * self.config["sl_atr_mult"] * end_mult
+                    current_sl_dist = original_sl_dist - (original_sl_dist - tight_sl_dist) * progress
+
+                    if is_long:
+                        new_sl = round(pos.entry_price - current_sl_dist, 6)
+                        if new_sl > pos.stop_loss:
+                            pos.stop_loss = new_sl
+                    else:
+                        new_sl = round(pos.entry_price + current_sl_dist, 6)
+                        if new_sl < pos.stop_loss:
+                            pos.stop_loss = new_sl
+
+            # 6. TIME EXIT
             if elapsed_h > self.config["max_hold_hours"]:
+                # Optional: extend hold for losing trades
+                if self.config.get("time_exit_require_profit", False):
+                    if is_long:
+                        unrealized = (bar_close - pos.entry_price) * pos.shares
+                    else:
+                        unrealized = (pos.entry_price - bar_close) * pos.shares
+                    fee_est = pos.cost_usd * self.config["taker_fee_pct"] * 2
+                    if unrealized < fee_est:
+                        ext_hours = self.config.get("time_exit_extension_hours", 6)
+                        if elapsed_h <= self.config["max_hold_hours"] + ext_hours:
+                            continue  # Hold longer, let progressive stop handle it
                 to_close.append((pos, "time_exit", bar_close, ts))
                 continue
 

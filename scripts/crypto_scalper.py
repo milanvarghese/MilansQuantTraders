@@ -1,4 +1,4 @@
-"""Pro-grade crypto scalping bot v3.2 — research-backed, multi-signal confluence.
+"""Pro-grade crypto scalping bot v3.3 — research-backed, multi-signal confluence.
 
 Architecture:
 1. DYNAMIC PAIR DISCOVERY — scans Coinbase for all liquid USD pairs, refreshes hourly
@@ -19,15 +19,20 @@ Architecture:
 16. ENGULFING PATTERNS — strong reversal candlestick patterns
 17. SWING LEVEL S/R — entry confirmation at key support/resistance
 18. ATR EXPANSION FILTER — only trade during active vol (avoid fee-eating chop)
+19. PROGRESSIVE STOP TIGHTENING — gradually tighten SL in second half of hold
+20. PAIR WHITELIST — restrict to backtest-validated profitable pairs
 
-v3.2 changes (backtest-validated, 14 pairs, 90 days):
-- Added 4 new signal types (RSI divergence, engulfing, swing S/R, ATR ratio)
-- Widened exits: TP=4.0x ATR, SL=3.5x ATR (was 2.5/2.0 — wider SL lets winners develop)
-- Disabled trailing stop (was causing premature exits, hurting PF from 0.23 to 0.82)
-- Raised confluence threshold to 6 (higher selectivity: 330 trades vs 298, +28% WR)
-- Extended hold time to 36h (was 12h — 1H ATR moves need time to develop)
-- Disabled breakeven stop (was cutting winners short)
-- Target: profitable at Binance fee tier (0.1%/side), break-even at CB Advanced (0.25%)
+v3.3 changes (backtest-validated, 166 trades, 90 days, 6 pairs):
+- Raised confluence to 7 (higher selectivity: 59.6% WR vs 52% at score=6)
+- Added progressive stop tightening (50%/0.3x): tighten SL from 3.5x to 1.05x ATR
+  over second half of hold. Converts losing time_exits into earlier SL exits.
+  Time exit PnL: -$0.38 (was -$4.24 at v3.2)
+- Added pair whitelist: only trade ATOM/LINK/DOGE/ETH/ADA/BTC (top 6 from backtest)
+  Dropping DOT/AVAX/UNI/SUI/XRP/SOL saved $5.54/90d in losses
+- Results @ Binance 0.1%: PF=1.77, +$7.60/90d (+15.2% ROI), DD=2.3%
+- Results @ Kraken 0.2%: PF=1.26, +$2.44/90d
+- Results @ CB Advanced 0.25%: PF=1.00 (break-even)
+- Results @ CB Standard 0.6%: PF=0.52 (not profitable — need sub-0.25% fees)
 
 Paper trades by default. Uses real market data from Coinbase + Binance.
 """
@@ -69,10 +74,13 @@ SCALPER_CONFIG = {
     "max_position_usd": 6.00,       # Moderate size, high turnover
     "max_open_positions": 5,         # HFT: more concurrent positions
     "max_exposure_pct": 0.70,        # 70% of bankroll at risk (higher turnover)
-    # Confluence requirements (v3.2: raised from 4 to 6 — backtest showed +28% WR improvement)
-    "min_confluence_score": 6,       # Require 6+ confluence for entry (was 4)
+    # Confluence requirements (v3.3: raised from 6 to 7 — backtest: 59.6% WR vs 52% at score=6)
+    "min_confluence_score": 7,       # Require 7+ confluence for entry (was 6, v3.2)
     "min_signal_quality": "C",       # Accept C-grade+ signals
     "min_ranging_score": 5,          # Higher bar in ranging markets (backtest: 11% WR otherwise)
+    # Pair whitelist: only trade backtest-validated profitable pairs
+    # Set to None/empty to trade all pairs from dynamic discovery
+    "pair_whitelist": ["BTC", "ETH", "DOGE", "ADA", "ATOM", "LINK"],
     # Regime-adaptive thresholds
     "adx_trending": 25,              # ADX > 25 = trending
     "adx_ranging": 20,               # ADX < 20 = ranging
@@ -88,8 +96,17 @@ SCALPER_CONFIG = {
     "tp_atr_mult": 4.0,             # 4.0x 1H ATR — wider target catches bigger moves (was 2.5)
     "sl_atr_mult": 3.5,             # 3.5x 1H ATR — wide stop avoids premature exits (was 2.0)
     "trailing_atr_mult": 999.0,     # Disabled — trailing stop was cutting winners short (was 1.5)
+    "min_trail_activation_atr": 0,   # Min ATR profit before trailing activates (0 = immediate)
     "max_hold_hours": 36,            # 36h holds for 1H ATR moves to develop (was 12)
     "breakeven_at_1r": False,        # Disabled — was hurting PF by cutting winners (was True)
+    # Progressive stop tightening (v3.3): after 50% of max_hold, tighten SL from 3.5x→1.05x ATR
+    # Backtest: time_exit PnL went from -$4.24 to -$0.38 (converts losers to earlier SL exits)
+    "progressive_stop": True,        # Enable progressive stop tightening
+    "progressive_stop_start_pct": 0.5,  # Start tightening at 50% of max_hold (18h)
+    "progressive_stop_end_mult": 0.3,   # Final SL = 0.3x original distance (1.05x ATR)
+    # Time exit filter: only close via time_exit if trade is profitable
+    "time_exit_require_profit": False,   # If True, extend hold for losing time exits
+    "time_exit_extension_hours": 6,      # Extra hours for losing time exits (then force close)
     # Risk management
     "kelly_fraction": 0.10,          # Slightly conservative per-trade
     "max_daily_loss": -5.00,
@@ -958,6 +975,16 @@ class PairScanner:
         qualified = qualified[:max_pairs]
 
         result = [q["pair"] for q in qualified]
+
+        # v3.3: Apply pair whitelist if configured
+        whitelist = self.config.get("pair_whitelist")
+        if whitelist:
+            whitelist_set = {w.upper() for w in whitelist}
+            before = len(result)
+            result = [p for p in result if p.replace("-USD", "") in whitelist_set]
+            logger.info(f"  Pair whitelist active: {before} -> {len(result)} pairs "
+                       f"(whitelist: {', '.join(sorted(whitelist_set))})")
+
         self._cached_pairs = result
         self._last_scan_time = now
 
@@ -2123,15 +2150,44 @@ class CryptoScalper:
                     to_close.append((pos, "trailing_stop", current))
                     continue
 
-            # 5. TIME EXIT
+            # 5. PROGRESSIVE STOP TIGHTENING
+            # After X% of max_hold, gradually tighten SL toward entry
+            # Backtest-validated: converts losing time_exits into earlier SL exits
             try:
                 opened = datetime.fromisoformat(pos["opened_at"])
                 elapsed_h = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
-                if elapsed_h > self.config["max_hold_hours"]:
-                    to_close.append((pos, "time_exit", current))
-                    continue
             except (ValueError, TypeError):
-                pass
+                elapsed_h = 0
+
+            if self.config.get("progressive_stop", False) and elapsed_h > 0:
+                max_hold = self.config["max_hold_hours"]
+                start_pct = self.config.get("progressive_stop_start_pct", 0.5)
+                end_mult = self.config.get("progressive_stop_end_mult", 0.3)
+                hold_pct = elapsed_h / max_hold if max_hold > 0 else 0
+
+                if hold_pct >= start_pct:
+                    progress = min(1.0, (hold_pct - start_pct) / (1.0 - start_pct))
+                    original_sl_dist = atr * self.config["sl_atr_mult"]
+                    tight_sl_dist = original_sl_dist * end_mult
+                    current_sl_dist = original_sl_dist - (original_sl_dist - tight_sl_dist) * progress
+
+                    if is_long:
+                        new_sl = round(entry - current_sl_dist, 6)
+                        if new_sl > pos["stop_loss"]:
+                            pos["stop_loss"] = new_sl
+                            logger.debug(f"[{pos['id']}] Progressive stop tightened to {new_sl:.6f} "
+                                       f"({hold_pct:.0%} of max hold)")
+                    else:
+                        new_sl = round(entry + current_sl_dist, 6)
+                        if new_sl < pos["stop_loss"]:
+                            pos["stop_loss"] = new_sl
+                            logger.debug(f"[{pos['id']}] Progressive stop tightened to {new_sl:.6f} "
+                                       f"({hold_pct:.0%} of max hold)")
+
+            # 6. TIME EXIT
+            if elapsed_h > self.config["max_hold_hours"]:
+                to_close.append((pos, "time_exit", current))
+                continue
 
         for pos, reason, price in to_close:
             self.close_position(pos, price, reason)

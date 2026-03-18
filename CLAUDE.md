@@ -17,7 +17,7 @@ Both run 24/7 on an Oracle Cloud server (129.153.155.228) with a Flask dashboard
 source venv/bin/activate  # Linux/server
 venv\Scripts\activate     # Windows local
 
-# Crypto scalper (v3.2: 17 signals, backtest-optimized exits)
+# Crypto scalper (v3.3: 20 features, progressive stop, pair whitelist)
 python scripts/crypto_scalper.py --interval 60           # Run with 60-sec scans
 python scripts/crypto_scalper.py --status                 # Print current state
 python scripts/crypto_scalper.py --reset                  # Wipe state for fresh start
@@ -34,6 +34,11 @@ python scripts/scalper_backtester.py --pairs BTC,ETH --days 30 --tp-mult 3.0
 python scripts/backtest_lab.py baseline                   # Run baseline with current config
 python scripts/backtest_lab.py sweep-tp-sl                # Sweep TP/SL ATR multipliers
 python scripts/backtest_lab.py sweep-confluence            # Sweep min confluence score
+python scripts/backtest_lab.py sweep-progressive           # Sweep progressive stop params
+python scripts/backtest_lab.py sweep-fees                  # Sweep fee tiers
+python scripts/backtest_lab.py sweep-sl                    # Sweep tighter stop losses
+python scripts/backtest_lab.py sweep-pairs                 # Test pair subsets
+python scripts/backtest_lab.py sweep-v4                    # V4 optimization combos
 python scripts/backtest_lab.py sweep-combined              # Test promising combinations
 python scripts/backtest_lab.py custom "description" key=val  # Custom parameter test
 python scripts/backtest_lab.py report                      # Print full backtest history
@@ -53,14 +58,14 @@ python scripts/opportunity_scanner.py --scan-once
 
 ## Architecture
 
-### Crypto Scalper (`scripts/crypto_scalper.py` ~2500 lines)
+### Crypto Scalper (`scripts/crypto_scalper.py` ~2600 lines)
 Self-contained trading engine with no imports from other project modules. Key classes:
-- `PairScanner` - Dynamically discovers 60-80+ liquid USD pairs from Coinbase product catalog (refreshes hourly)
+- `PairScanner` - Dynamically discovers liquid USD pairs from Coinbase, filtered by whitelist (v3.3: BTC/ETH/DOGE/ADA/ATOM/LINK)
 - `CoinbaseDataClient` / `BinanceDataClient` - Market data (OHLCV candles, order book, funding rates)
 - `SignalDetector` - 17-signal confluence scoring (0-17 scale): regime detection (ADX), multi-timeframe (1H+5M), order book imbalance, funding rates, FVG, volume profile, RSI, Bollinger, MACD, RSI divergence, engulfing patterns, swing S/R, ATR expansion
 - `CryptoScalper` - Main loop: scan pairs, score signals, open/manage/close positions
-- Dynamic pair discovery: scans Coinbase for all USD pairs, filters by 24h volume ($500K+) and spread (<0.15%)
-- Dynamic ATR exits: TP=4.0x 1H ATR, SL=3.5x 1H ATR, no trailing (backtest-optimized v3.2)
+- v3.3 exits: TP=4.0x 1H ATR, SL=3.5x ATR + progressive tightening (SL narrows from 3.5x to 1.05x ATR over second half of hold)
+- v3.3 results @ Binance 0.1%: PF=1.77, +$7.60/90d, 59.6% WR, DD=2.3% (166 trades)
 - Auto-tunes every 20 closed trades via `_auto_tune()` (adjusts thresholds, drops losing pairs)
 - Records full market context per trade in `analytics.jsonl` for post-hoc analysis
 
@@ -84,7 +89,7 @@ These modules work together:
 - `logs/risk_state.json` - Risk manager persistent state
 
 ### Critical Implementation Details
-- **1H ATR exits**: Exit levels (TP/SL) use 1H ATR, not 5m ATR. v3.2 backtest (117 runs, 14 pairs, 90 days): TP=4.0x ATR, SL=3.5x ATR, no trailing. Profitable at Binance fees (PF=1.18, +$3.56), break-even at CB Advanced (PF=1.00). Key finding: trailing stop (was 1.5x ATR) was destroying edge by cutting winners short
+- **1H ATR exits + progressive stop**: Exit levels use 1H ATR. v3.3 backtest (166 trades, 6 pairs, 90 days): TP=4.0x ATR, SL=3.5x ATR (tightens to 1.05x over second half of hold), no trailing. At Binance 0.1%: PF=1.77, +$7.60, 59.6% WR. Progressive stop converts time_exit drag from -$4.24 to +$0.09. Pair whitelist (BTC/ETH/DOGE/ADA/ATOM/LINK) saved $5.54. Break-even at CB Advanced 0.25%
 - **Atomic state writes**: Both bots write to temp file then `os.replace()` to prevent corruption on crash
 - **Wilder's smoothing**: Used for RSI, ATR, ADX (not simple moving averages)
 - **MACD**: Running EMA series via `calc_ema_series()`, not re-seeded subset EMAs
