@@ -1,0 +1,330 @@
+{
+  "generated_at": "2026-03-18T04:40:07.471075+00:00",
+  "config": {
+    "pairs": [
+      "BTC-USD",
+      "ETH-USD",
+      "SOL-USD",
+      "DOGE-USD",
+      "AVAX-USD",
+      "LINK-USD",
+      "XRP-USD",
+      "SUI-USD"
+    ],
+    "dynamic_pairs": true,
+    "min_24h_volume_usd": 500000,
+    "max_spread_pct": 0.15,
+    "pair_refresh_interval_sec": 3600,
+    "max_pairs": 80,
+    "bankroll": 50.0,
+    "max_position_usd": 6.0,
+    "max_open_positions": 5,
+    "max_exposure_pct": 0.7,
+    "min_confluence_score": 4,
+    "min_signal_quality": "C",
+    "min_ranging_score": 5,
+    "adx_trending": 25,
+    "adx_ranging": 20,
+    "rsi_oversold_trending": 35,
+    "rsi_overbought_trending": 65,
+    "rsi_oversold_ranging": 28,
+    "rsi_overbought_ranging": 72,
+    "volume_spike_mult": 1.8,
+    "bb_squeeze_threshold": 0.012,
+    "tp_atr_mult": 2.5,
+    "sl_atr_mult": 2.0,
+    "trailing_atr_mult": 1.5,
+    "max_hold_hours": 12,
+    "breakeven_at_1r": true,
+    "kelly_fraction": 0.1,
+    "max_daily_loss": -5.0,
+    "max_daily_trades": 30,
+    "cooldown_after_loss_sec": 180,
+    "max_consecutive_losses": 4,
+    "scan_interval_sec": 60,
+    "candle_granularity_entry": "FIVE_MINUTE",
+    "candle_granularity_trend": "ONE_HOUR",
+    "candle_lookback": 50,
+    "taker_fee_pct": 0.006,
+    "maker_fee_pct": 0.004,
+    "ob_strong_buy": 0.2,
+    "ob_strong_sell": -0.2,
+    "funding_extreme_high": 0.0005,
+    "funding_extreme_low": -0.0003,
+    "fear_greed_extreme_fear": 20,
+    "fear_greed_extreme_greed": 80,
+    "fear_greed_no_trade_zone": 10,
+    "cusum_threshold": 0.002,
+    "pump_volume_mult": 5.0,
+    "pump_price_change_pct": 0.03,
+    "vol_lookback_hours": 24,
+    "vol_spike_mult": 2.0,
+    "bandit_lookback": 50,
+    "bandit_decay": 0.95
+  },
+  "summary": {
+    "total_trades": 298,
+    "winning_trades": 71,
+    "win_rate": 0.2383,
+    "total_pnl": -10.1334,
+    "final_bankroll": 39.87,
+    "profit_factor": 0.2291,
+    "sharpe_ratio": 0.2901,
+    "max_drawdown_pct": 20.27,
+    "max_drawdown_usd": 10.13,
+    "avg_win": 0.0424,
+    "avg_loss": 0.0579,
+    "avg_hold_minutes": 274.1
+  },
+  "by_component": {
+    "1H_TREND_UP": {
+      "wins": 28,
+      "total": 121,
+      "pnl": -3.7605,
+      "win_rate": 0.23140495867768596
+    },
+    "VOL_SPIKE_BULL": {
+      "wins": 18,
+      "total": 63,
+      "pnl": -1.5355,
+      "win_rate": 0.2857142857142857
+    },
+    "ABOVE_VWAP": {
+      "wins": 24,
+      "total": 110,
+      "pnl": -3.6851,
+      "win_rate": 0.21818181818181817
+    },
+    "FVG_FILL": {
+      "wins": 5,
+      "total": 28,
+      "pnl": -0.8883,
+      "win_rate": 0.17857142857142858
+    },
+    "MACD_BULL_CROSS": {
+      "wins": 11,
+      "total": 49,
+      "pnl": -1.8651,
+      "win_rate": 0.22448979591836735
+    },
+    "CUSUM_UP": {
+      "wins": 25,
+      "total": 96,
+      "pnl": -2.7833,
+      "win_rate": 0.2604166666666667
+    },
+    "RSI_OVERBOUGHT": {
+      "wins": 7,
+      "total": 26,
+      "pnl": -0.7959,
+      "win_rate": 0.2692307692307692
+    },
+    "BB_UPPER_TOUCH": {
+      "wins": 5,
+      "total": 17,
+      "pnl": -0.5273,
+      "win_rate": 0.29411764705882354
+    },
+    "AT_VAH": {
+      "wins": 6,
+      "total": 21,
+      "pnl": -0.6065,
+      "win_rate": 0.2857142857142857
+    },
+    "1H_TREND_DOWN": {
+      "wins": 37,
+      "total": 154,
+      "pnl": -5.6312,
+      "win_rate": 0.24025974025974026
+    },
+    "MACD_BEAR_CROSS": {
+      "wins": 14,
+      "total": 71,
+      "pnl": -2.803,
+      "win_rate": 0.19718309859154928
+    },
+    "BELOW_VWAP_BEARISH": {
+      "wins": 34,
+      "total": 143,
+      "pnl": -5.2622,
+      "win_rate": 0.23776223776223776
+    },
+    "CUSUM_DOWN": {
+      "wins": 37,
+      "total": 150,
+      "pnl": -5.591,
+      "win_rate": 0.24666666666666667
+    },
+    "FVG_FILL_BEAR": {
+      "wins": 3,
+      "total": 33,
+      "pnl": -1.5158,
+      "win_rate": 0.09090909090909091
+    },
+    "AT_VAL": {
+      "wins": 1,
+      "total": 6,
+      "pnl": -0.1235,
+      "win_rate": 0.16666666666666666
+    },
+    "VOL_SPIKE_BEAR": {
+      "wins": 29,
+      "total": 90,
+      "pnl": -2.8211,
+      "win_rate": 0.32222222222222224
+    },
+    "RSI_OVERSOLD": {
+      "wins": 2,
+      "total": 8,
+      "pnl": -0.256,
+      "win_rate": 0.25
+    },
+    "BB_LOWER_TOUCH": {
+      "wins": 2,
+      "total": 7,
+      "pnl": -0.2034,
+      "win_rate": 0.2857142857142857
+    }
+  },
+  "by_pair": {
+    "NEAR": {
+      "wins": 7,
+      "total": 35,
+      "pnl": -1.4396,
+      "win_rate": 0.2
+    },
+    "AVAX": {
+      "wins": 12,
+      "total": 46,
+      "pnl": -1.3614,
+      "win_rate": 0.2608695652173913
+    },
+    "DOGE": {
+      "wins": 10,
+      "total": 28,
+      "pnl": -0.8343,
+      "win_rate": 0.35714285714285715
+    },
+    "SOL": {
+      "wins": 8,
+      "total": 28,
+      "pnl": -0.8657,
+      "win_rate": 0.2857142857142857
+    },
+    "SUI": {
+      "wins": 7,
+      "total": 28,
+      "pnl": -1.0348,
+      "win_rate": 0.25
+    },
+    "ETH": {
+      "wins": 6,
+      "total": 25,
+      "pnl": -0.7857,
+      "win_rate": 0.24
+    },
+    "BTC": {
+      "wins": 3,
+      "total": 30,
+      "pnl": -1.1676,
+      "win_rate": 0.1
+    },
+    "XRP": {
+      "wins": 5,
+      "total": 19,
+      "pnl": -0.4783,
+      "win_rate": 0.2631578947368421
+    },
+    "LINK": {
+      "wins": 4,
+      "total": 21,
+      "pnl": -0.8573,
+      "win_rate": 0.19047619047619047
+    },
+    "ADA": {
+      "wins": 9,
+      "total": 38,
+      "pnl": -1.3087,
+      "win_rate": 0.23684210526315788
+    }
+  },
+  "by_regime": {
+    "transitional": {
+      "wins": 18,
+      "total": 76,
+      "pnl": -2.7098,
+      "win_rate": 0.23684210526315788
+    },
+    "trending_up": {
+      "wins": 24,
+      "total": 98,
+      "pnl": -3.1405,
+      "win_rate": 0.24489795918367346
+    },
+    "ranging": {
+      "wins": 3,
+      "total": 14,
+      "pnl": -0.5251,
+      "win_rate": 0.21428571428571427
+    },
+    "trending_down": {
+      "wins": 25,
+      "total": 105,
+      "pnl": -3.59,
+      "win_rate": 0.23809523809523808
+    },
+    "trending": {
+      "wins": 1,
+      "total": 5,
+      "pnl": -0.168,
+      "win_rate": 0.2
+    }
+  },
+  "by_grade": {
+    "B": {
+      "wins": 7,
+      "total": 39,
+      "pnl": -2.2575,
+      "win_rate": 0.1794871794871795
+    },
+    "C": {
+      "wins": 64,
+      "total": 259,
+      "pnl": -7.8759,
+      "win_rate": 0.2471042471042471
+    }
+  },
+  "by_exit_reason": {
+    "stop_loss": {
+      "wins": 9,
+      "total": 217,
+      "pnl": -12.4719,
+      "win_rate": 0.041474654377880185
+    },
+    "time_exit": {
+      "wins": 9,
+      "total": 20,
+      "pnl": 0.086,
+      "win_rate": 0.45
+    },
+    "take_profit": {
+      "wins": 48,
+      "total": 50,
+      "pnl": 2.1744,
+      "win_rate": 0.96
+    },
+    "trailing_stop": {
+      "wins": 5,
+      "total": 10,
+      "pnl": 0.1153,
+      "win_rate": 0.5
+    },
+    "backtest_end": {
+      "wins": 0,
+      "total": 1,
+      "pnl": -0.0372,
+      "win_rate": 0.0
+    }
+  },
+  "trade_count": 298
+}

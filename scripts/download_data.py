@@ -25,18 +25,22 @@ logger = logging.getLogger(__name__)
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 COINBASE_API = "https://api.exchange.coinbase.com"
 
-# Coinbase product IDs
+# Coinbase product IDs — top liquid pairs for scalper backtesting
 PRODUCTS = {
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
-    "SOL": "SOL-USD",
-    "XRP": "XRP-USD",
-    "DOGE": "DOGE-USD",
-    "ADA": "ADA-USD",
-    "AVAX": "AVAX-USD",
-    "DOT": "DOT-USD",
-    "LINK": "LINK-USD",
-    "LTC": "LTC-USD",
+    # Tier 1: Major pairs (highest volume)
+    "BTC": "BTC-USD", "ETH": "ETH-USD", "XRP": "XRP-USD", "SOL": "SOL-USD",
+    "DOGE": "DOGE-USD", "ADA": "ADA-USD", "AVAX": "AVAX-USD", "LINK": "LINK-USD",
+    "DOT": "DOT-USD", "LTC": "LTC-USD",
+    # Tier 2: High volume altcoins
+    "SUI": "SUI-USD", "NEAR": "NEAR-USD", "UNI": "UNI-USD", "ATOM": "ATOM-USD",
+    "ARB": "ARB-USD", "OP": "OP-USD", "HBAR": "HBAR-USD", "FET": "FET-USD",
+    "RENDER": "RENDER-USD", "ONDO": "ONDO-USD",
+    # Tier 3: Active trading pairs
+    "AAVE": "AAVE-USD", "ICP": "ICP-USD", "FIL": "FIL-USD", "APT": "APT-USD",
+    "XLM": "XLM-USD", "ALGO": "ALGO-USD", "VET": "VET-USD", "SEI": "SEI-USD",
+    "STX": "STX-USD", "CRV": "CRV-USD", "ZEC": "ZEC-USD", "BCH": "BCH-USD",
+    "ENA": "ENA-USD", "TIA": "TIA-USD", "BONK": "BONK-USD", "TAO": "TAO-USD",
+    "WLD": "WLD-USD", "DASH": "DASH-USD", "BNB": "BNB-USD", "QNT": "QNT-USD",
 }
 
 # Coinbase returns max 300 candles per request
@@ -56,8 +60,9 @@ def download_candles(symbol: str, days: int = 730, granularity: int = 3600) -> s
     """
     product_id = PRODUCTS.get(symbol)
     if not product_id:
-        logger.error(f"Unknown symbol: {symbol}. Available: {list(PRODUCTS.keys())}")
-        return ""
+        # Allow arbitrary Coinbase product IDs (e.g. "TAO" -> "TAO-USD")
+        product_id = f"{symbol}-USD"
+        logger.info(f"Symbol {symbol} not in default list, trying {product_id}")
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -281,6 +286,8 @@ def main():
                        help="Skip Polymarket market downloads")
     parser.add_argument("--polymarket-pages", type=int, default=20,
                        help="Pages of Polymarket data (100 markets/page, default: 20)")
+    parser.add_argument("--scalper-backtest", action="store_true",
+                       help="Download 5m candles (90 days) for all pairs — for scalper backtesting")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -293,9 +300,21 @@ def main():
     print("  DATA DOWNLOADER FOR BACKTESTING")
     print("=" * 60)
 
+    # Scalper backtest mode: download 5m candles for all pairs
+    if args.scalper_backtest:
+        all_symbols = list(PRODUCTS.keys())
+        print(f"\n[SCALPER BACKTEST] Downloading 5m candles for {len(all_symbols)} pairs (90 days)...")
+        for sym in all_symbols:
+            print()
+            download_candles(sym, days=90, granularity=300)
+        print(f"\n{'='*60}")
+        print(f"  DONE. 5m candle data saved to: {DATA_DIR}")
+        print(f"{'='*60}")
+        return
+
     # Download crypto OHLC
     if not args.skip_crypto:
-        symbols = [args.symbol.upper()] if args.symbol else ["BTC", "ETH", "SOL"]
+        symbols = [args.symbol.upper()] if args.symbol else list(PRODUCTS.keys())
         print(f"\n[1/2] Downloading crypto OHLC ({', '.join(symbols)})...")
         for sym in symbols:
             print()

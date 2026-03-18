@@ -17,12 +17,26 @@ Both run 24/7 on an Oracle Cloud server (129.153.155.228) with a Flask dashboard
 source venv/bin/activate  # Linux/server
 venv\Scripts\activate     # Windows local
 
-# Crypto scalper
-python scripts/crypto_scalper.py --interval 30           # Run with 30-sec scans
+# Crypto scalper (v3.2: 17 signals, backtest-optimized exits)
+python scripts/crypto_scalper.py --interval 60           # Run with 60-sec scans
 python scripts/crypto_scalper.py --status                 # Print current state
 python scripts/crypto_scalper.py --reset                  # Wipe state for fresh start
 python scripts/crypto_scalper.py --scan-once --verbose    # Single scan with debug output
-python scripts/crypto_scalper.py --pairs "BTC,ETH" --min-score 5
+python scripts/crypto_scalper.py --pairs "BTC,ETH" --min-score 5  # Static pairs (disables dynamic)
+
+# Scalper backtester (validate signal engine against historical data)
+python scripts/download_data.py --scalper-backtest        # Download 5m data for all pairs (90d)
+python scripts/scalper_backtester.py                      # Backtest all pairs with data
+python scripts/scalper_backtester.py --optimize --report  # Parameter optimization sweep
+python scripts/scalper_backtester.py --pairs BTC,ETH --days 30 --tp-mult 3.0
+
+# Backtest laboratory (systematic testing with history tracking)
+python scripts/backtest_lab.py baseline                   # Run baseline with current config
+python scripts/backtest_lab.py sweep-tp-sl                # Sweep TP/SL ATR multipliers
+python scripts/backtest_lab.py sweep-confluence            # Sweep min confluence score
+python scripts/backtest_lab.py sweep-combined              # Test promising combinations
+python scripts/backtest_lab.py custom "description" key=val  # Custom parameter test
+python scripts/backtest_lab.py report                      # Print full backtest history
 
 # Polymarket paper trader
 python scripts/paper_trader.py --interval 5 --update-interval 1  # 5-min scans, 1-min price updates
@@ -39,15 +53,16 @@ python scripts/opportunity_scanner.py --scan-once
 
 ## Architecture
 
-### Crypto Scalper (`scripts/crypto_scalper.py` ~1700 lines)
+### Crypto Scalper (`scripts/crypto_scalper.py` ~2500 lines)
 Self-contained trading engine with no imports from other project modules. Key classes:
+- `PairScanner` - Dynamically discovers 60-80+ liquid USD pairs from Coinbase product catalog (refreshes hourly)
 - `CoinbaseDataClient` / `BinanceDataClient` - Market data (OHLCV candles, order book, funding rates)
-- `SignalDetector` - 9-signal confluence scoring (0-10 scale): regime detection (ADX), multi-timeframe (1H+5M), order book imbalance, funding rates, FVG, volume profile, RSI, Bollinger, MACD
+- `SignalDetector` - 17-signal confluence scoring (0-17 scale): regime detection (ADX), multi-timeframe (1H+5M), order book imbalance, funding rates, FVG, volume profile, RSI, Bollinger, MACD, RSI divergence, engulfing patterns, swing S/R, ATR expansion
 - `CryptoScalper` - Main loop: scan pairs, score signals, open/manage/close positions
-- Entry requires confluence >= 4 AND signal grade >= B
-- Dynamic ATR exits: TP=3x ATR, SL=1.5x ATR, breakeven at 1R, trailing at 2x ATR
+- Dynamic pair discovery: scans Coinbase for all USD pairs, filters by 24h volume ($500K+) and spread (<0.15%)
+- Dynamic ATR exits: TP=4.0x 1H ATR, SL=3.5x 1H ATR, no trailing (backtest-optimized v3.2)
 - Auto-tunes every 20 closed trades via `_auto_tune()` (adjusts thresholds, drops losing pairs)
-- Records full market context per trade in `analytics.json` for post-hoc analysis
+- Records full market context per trade in `analytics.jsonl` for post-hoc analysis
 
 ### Polymarket Side (`scripts/paper_trader.py`, `opportunity_scanner.py`, `probability_engine.py`, `risk_manager.py`)
 These modules work together:
@@ -69,6 +84,7 @@ These modules work together:
 - `logs/risk_state.json` - Risk manager persistent state
 
 ### Critical Implementation Details
+- **1H ATR exits**: Exit levels (TP/SL) use 1H ATR, not 5m ATR. v3.2 backtest (117 runs, 14 pairs, 90 days): TP=4.0x ATR, SL=3.5x ATR, no trailing. Profitable at Binance fees (PF=1.18, +$3.56), break-even at CB Advanced (PF=1.00). Key finding: trailing stop (was 1.5x ATR) was destroying edge by cutting winners short
 - **Atomic state writes**: Both bots write to temp file then `os.replace()` to prevent corruption on crash
 - **Wilder's smoothing**: Used for RSI, ATR, ADX (not simple moving averages)
 - **MACD**: Running EMA series via `calc_ema_series()`, not re-seeded subset EMAs

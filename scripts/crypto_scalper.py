@@ -1,19 +1,33 @@
-"""Pro-grade crypto scalping bot v3.0 — research-backed, multi-signal confluence.
+"""Pro-grade crypto scalping bot v3.2 — research-backed, multi-signal confluence.
 
 Architecture:
-1. REGIME DETECTION — ADX classifies trending vs ranging, adapts strategy
-2. MULTI-TIMEFRAME — 1H trend direction, 5M entry timing
-3. CONFLUENCE SCORING — 0-13 scale with signal performance weighting
-4. ORDER BOOK IMBALANCE — confirms direction from Coinbase L2 book
-5. FUNDING RATE — extreme rates predict reversals (Binance public API)
-6. FAIR VALUE GAPS — institutional footprints in price action
-7. VOLUME PROFILE — POC/VAH/VAL as targets and support/resistance
-8. DYNAMIC ATR EXITS — volatility-scaled TP/SL, not fixed percentages
-9. FEAR & GREED FILTER — sentiment regime from alternative.me API
-10. CUSUM ENTRY FILTER — only trade on meaningful price moves (Lopez de Prado)
-11. PUMP DETECTION — skip coins with suspicious volume spikes
-12. CROSS-ASSET VOL TRACKER — BTC vol spillover early warning
-13. SIGNAL PERFORMANCE BANDIT — auto-weight signals by recent success
+1. DYNAMIC PAIR DISCOVERY — scans Coinbase for all liquid USD pairs, refreshes hourly
+2. REGIME DETECTION — ADX classifies trending vs ranging, adapts strategy
+3. MULTI-TIMEFRAME — 1H trend direction, 5M entry timing
+4. CONFLUENCE SCORING — 0-17 scale with signal performance weighting
+5. ORDER BOOK IMBALANCE — confirms direction from Coinbase L2 book
+6. FUNDING RATE — extreme rates predict reversals (Binance public API)
+7. FAIR VALUE GAPS — institutional footprints in price action
+8. VOLUME PROFILE — POC/VAH/VAL as targets and support/resistance
+9. DYNAMIC ATR EXITS — volatility-scaled TP/SL, not fixed percentages
+10. FEAR & GREED FILTER — sentiment regime from alternative.me API
+11. CUSUM ENTRY FILTER — only trade on meaningful price moves (Lopez de Prado)
+12. PUMP DETECTION — skip coins with suspicious volume spikes
+13. CROSS-ASSET VOL TRACKER — BTC vol spillover early warning
+14. SIGNAL PERFORMANCE BANDIT — auto-weight signals by recent success
+15. RSI DIVERGENCE — proven mean reversion signal (price vs RSI disagreement)
+16. ENGULFING PATTERNS — strong reversal candlestick patterns
+17. SWING LEVEL S/R — entry confirmation at key support/resistance
+18. ATR EXPANSION FILTER — only trade during active vol (avoid fee-eating chop)
+
+v3.2 changes (backtest-validated, 14 pairs, 90 days):
+- Added 4 new signal types (RSI divergence, engulfing, swing S/R, ATR ratio)
+- Widened exits: TP=4.0x ATR, SL=3.5x ATR (was 2.5/2.0 — wider SL lets winners develop)
+- Disabled trailing stop (was causing premature exits, hurting PF from 0.23 to 0.82)
+- Raised confluence threshold to 6 (higher selectivity: 330 trades vs 298, +28% WR)
+- Extended hold time to 36h (was 12h — 1H ATR moves need time to develop)
+- Disabled breakeven stop (was cutting winners short)
+- Target: profitable at Binance fee tier (0.1%/side), break-even at CB Advanced (0.25%)
 
 Paper trades by default. Uses real market data from Coinbase + Binance.
 """
@@ -38,21 +52,27 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 SCALPER_CONFIG = {
-    # Focused pair list: top 8 most liquid, best spreads
+    # Dynamic pair discovery: scans Coinbase for all liquid USD pairs
+    # These are fallback seeds — replaced at startup by live scan
     "pairs": [
         "BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD",
         "AVAX-USD", "LINK-USD", "XRP-USD", "SUI-USD",
-        "ADA-USD", "DOT-USD", "NEAR-USD", "MATIC-USD",
-        "UNI-USD", "ATOM-USD", "ARB-USD", "OP-USD",
     ],
+    # Dynamic pair discovery settings
+    "dynamic_pairs": True,               # Enable auto-discovery (disable with --pairs flag)
+    "min_24h_volume_usd": 500_000,       # Min 24h USD volume to be tradeable
+    "max_spread_pct": 0.15,              # Max bid-ask spread % (skip illiquid pairs)
+    "pair_refresh_interval_sec": 3600,   # Re-scan pair universe every hour
+    "max_pairs": 80,                     # Cap to avoid API rate limits
     # Bankroll
     "bankroll": 50.00,
     "max_position_usd": 6.00,       # Moderate size, high turnover
     "max_open_positions": 5,         # HFT: more concurrent positions
     "max_exposure_pct": 0.70,        # 70% of bankroll at risk (higher turnover)
-    # Confluence requirements
-    "min_confluence_score": 3,       # HFT: lower bar, faster entries (was 4)
-    "min_signal_quality": "C",       # HFT: accept C-grade+ for speed (was B)
+    # Confluence requirements (v3.2: raised from 4 to 6 — backtest showed +28% WR improvement)
+    "min_confluence_score": 6,       # Require 6+ confluence for entry (was 4)
+    "min_signal_quality": "C",       # Accept C-grade+ signals
+    "min_ranging_score": 5,          # Higher bar in ranging markets (backtest: 11% WR otherwise)
     # Regime-adaptive thresholds
     "adx_trending": 25,              # ADX > 25 = trending
     "adx_ranging": 20,               # ADX < 20 = ranging
@@ -62,20 +82,22 @@ SCALPER_CONFIG = {
     "rsi_overbought_ranging": 72,    # Slightly relaxed for more signals (was 75)
     "volume_spike_mult": 1.8,        # HFT: catch smaller volume moves (was 2.0)
     "bb_squeeze_threshold": 0.012,   # HFT: tighter squeeze detection (was 0.015)
-    # Dynamic exits (ATR-based) — HFT: tighter targets, faster turnover
-    "tp_atr_mult": 1.8,             # HFT: quick take profit = 1.8x ATR (was 3.0)
-    "sl_atr_mult": 1.2,             # HFT: tight stop loss = 1.2x ATR (was 1.5)
-    "trailing_atr_mult": 1.5,       # HFT: tighter trail = 1.5x ATR (was 2.0)
-    "max_hold_hours": 2,             # HFT: max 2 hours, not 8 — in and out fast
-    "breakeven_at_1r": True,         # Move stop to breakeven at 1R profit
+    # Dynamic exits (1H ATR-based) — v3.2 validated via backtest (90d, 14 pairs, 25K+ candles)
+    # Key insight: wider SL lets winners develop. PF improved from 0.23 to 0.82.
+    # At Binance 0.1%/side: PF=1.18, +$3.56/90d. At CB Advanced 0.25%: PF=1.00 (break-even).
+    "tp_atr_mult": 4.0,             # 4.0x 1H ATR — wider target catches bigger moves (was 2.5)
+    "sl_atr_mult": 3.5,             # 3.5x 1H ATR — wide stop avoids premature exits (was 2.0)
+    "trailing_atr_mult": 999.0,     # Disabled — trailing stop was cutting winners short (was 1.5)
+    "max_hold_hours": 36,            # 36h holds for 1H ATR moves to develop (was 12)
+    "breakeven_at_1r": False,        # Disabled — was hurting PF by cutting winners (was True)
     # Risk management
     "kelly_fraction": 0.10,          # Slightly conservative per-trade
     "max_daily_loss": -5.00,
     "max_daily_trades": 30,          # HFT: many more trades per day (was 10)
     "cooldown_after_loss_sec": 180,  # HFT: 3 min cooldown (was 10 min)
     "max_consecutive_losses": 4,     # HFT: tolerate more losses before pausing (was 3)
-    # Scan frequency — HFT: scan every 10 seconds
-    "scan_interval_sec": 10,         # HFT: 10-sec scans (was 30)
+    # Scan frequency — 1H ATR targets need minutes not seconds
+    "scan_interval_sec": 60,         # 1-min scans (was 10s HFT — wasted API calls)
     "candle_granularity_entry": "FIVE_MINUTE",   # 5M for entry signals
     "candle_granularity_trend": "ONE_HOUR",      # 1H for trend context
     "candle_lookback": 50,
@@ -104,6 +126,9 @@ SCALPER_CONFIG = {
     # Signal performance bandit: auto-weight signals
     "bandit_lookback": 50,           # Rolling window for signal performance
     "bandit_decay": 0.95,            # Exponential decay for older trades
+    # v3.2: Volatility expansion filter
+    "atr_contraction_threshold": 0.8,  # ATR ratio < 0.8 = contracted, skip entries
+    "atr_expansion_threshold": 1.3,    # ATR ratio > 1.3 = expanding, favor entries
 }
 
 # Coinbase Exchange API (free, no auth)
@@ -440,6 +465,147 @@ def calc_volume_profile(candles: list[dict], num_bins: int = 30
     }
 
 
+def detect_rsi_divergence(closes: list[float], period: int = 14,
+                          lookback: int = 20) -> Optional[str]:
+    """Detect RSI divergence — proven mean reversion signal in crypto.
+
+    Bullish divergence: price makes lower low, RSI makes higher low
+    Bearish divergence: price makes higher high, RSI makes lower high
+
+    Returns: "bullish", "bearish", or None
+    """
+    if len(closes) < period + lookback + 1:
+        return None
+
+    # Compute RSI at each point in the lookback window
+    rsi_values = []
+    for i in range(lookback + 1):
+        end = len(closes) - lookback + i
+        rsi = calc_rsi(closes[:end], period)
+        if rsi is None:
+            return None
+        rsi_values.append(rsi)
+
+    # Find swing lows and highs in the lookback window
+    price_window = closes[-(lookback + 1):]
+
+    # Find local minima (swing lows) for bullish divergence
+    swing_lows = []
+    for i in range(2, len(price_window) - 1):
+        if price_window[i] < price_window[i - 1] and price_window[i] < price_window[i - 2]:
+            if price_window[i] <= price_window[i + 1]:
+                swing_lows.append((i, price_window[i], rsi_values[i]))
+
+    # Bullish divergence: latest swing low has lower price but higher RSI
+    if len(swing_lows) >= 2:
+        prev_low = swing_lows[-2]
+        curr_low = swing_lows[-1]
+        if (curr_low[1] < prev_low[1] * 0.999  # Price lower (with tolerance)
+            and curr_low[2] > prev_low[2] + 2.0):  # RSI higher by at least 2 pts
+            return "bullish"
+
+    # Find local maxima (swing highs) for bearish divergence
+    swing_highs = []
+    for i in range(2, len(price_window) - 1):
+        if price_window[i] > price_window[i - 1] and price_window[i] > price_window[i - 2]:
+            if price_window[i] >= price_window[i + 1]:
+                swing_highs.append((i, price_window[i], rsi_values[i]))
+
+    # Bearish divergence: latest swing high has higher price but lower RSI
+    if len(swing_highs) >= 2:
+        prev_high = swing_highs[-2]
+        curr_high = swing_highs[-1]
+        if (curr_high[1] > prev_high[1] * 1.001  # Price higher
+            and curr_high[2] < prev_high[2] - 2.0):  # RSI lower by at least 2 pts
+            return "bearish"
+
+    return None
+
+
+def detect_engulfing(candles: list[dict]) -> Optional[str]:
+    """Detect bullish/bearish engulfing candle patterns.
+
+    Bullish engulfing: bearish candle followed by larger bullish candle that
+    completely engulfs the previous body.
+    """
+    if len(candles) < 2:
+        return None
+
+    prev = candles[-2]
+    curr = candles[-1]
+    prev_body = abs(prev["close"] - prev["open"])
+    curr_body = abs(curr["close"] - curr["open"])
+
+    if prev_body == 0 or curr_body == 0:
+        return None
+
+    # Require current candle body to be at least 1.2x previous
+    if curr_body < prev_body * 1.2:
+        return None
+
+    # Bullish engulfing
+    if (prev["close"] < prev["open"]  # Previous bearish
+        and curr["close"] > curr["open"]  # Current bullish
+        and curr["open"] <= prev["close"]  # Opens at or below prev close
+        and curr["close"] >= prev["open"]):  # Closes at or above prev open
+        return "bullish"
+
+    # Bearish engulfing
+    if (prev["close"] > prev["open"]  # Previous bullish
+        and curr["close"] < curr["open"]  # Current bearish
+        and curr["open"] >= prev["close"]  # Opens at or above prev close
+        and curr["close"] <= prev["open"]):  # Closes at or below prev open
+        return "bearish"
+
+    return None
+
+
+def find_swing_levels(candles: list[dict], num_levels: int = 3) -> dict:
+    """Find recent swing high/low support and resistance levels from 1H candles.
+
+    Returns dict with 'support' and 'resistance' lists of price levels.
+    """
+    if len(candles) < 10:
+        return {"support": [], "resistance": []}
+
+    swing_highs = []
+    swing_lows = []
+
+    for i in range(2, len(candles) - 2):
+        # Swing high: higher than 2 bars on each side
+        if (candles[i]["high"] > candles[i-1]["high"]
+            and candles[i]["high"] > candles[i-2]["high"]
+            and candles[i]["high"] > candles[i+1]["high"]
+            and candles[i]["high"] > candles[i+2]["high"]):
+            swing_highs.append(candles[i]["high"])
+
+        # Swing low: lower than 2 bars on each side
+        if (candles[i]["low"] < candles[i-1]["low"]
+            and candles[i]["low"] < candles[i-2]["low"]
+            and candles[i]["low"] < candles[i+1]["low"]
+            and candles[i]["low"] < candles[i+2]["low"]):
+            swing_lows.append(candles[i]["low"])
+
+    return {
+        "support": sorted(swing_lows)[-num_levels:] if swing_lows else [],
+        "resistance": sorted(swing_highs)[:num_levels] if swing_highs else [],
+    }
+
+
+def calc_atr_ratio(highs: list[float], lows: list[float], closes: list[float],
+                   fast_period: int = 5, slow_period: int = 20) -> Optional[float]:
+    """ATR expansion ratio: current ATR vs longer-term average.
+
+    > 1.2 means volatility is expanding (good for trend entries).
+    < 0.8 means volatility is contracting (chop, skip entries).
+    """
+    fast_atr = calc_atr(highs, lows, closes, fast_period)
+    slow_atr = calc_atr(highs, lows, closes, slow_period)
+    if fast_atr is None or slow_atr is None or slow_atr == 0:
+        return None
+    return fast_atr / slow_atr
+
+
 # ================================================================
 # MARKET DATA CLIENTS
 # ================================================================
@@ -648,6 +814,164 @@ class BinanceDataClient:
 
 
 # ================================================================
+# DYNAMIC PAIR DISCOVERY (v3.1)
+# ================================================================
+
+class PairScanner:
+    """Discovers tradeable pairs from Coinbase by scanning the full product catalog.
+
+    Filters by: USD quote currency, 'online' status, 24h volume, and bid-ask spread.
+    Refreshes the pair list periodically (default: every hour).
+    """
+
+    # Stablecoins and wrapped tokens to exclude (not useful for scalping)
+    EXCLUDED_BASES = {
+        "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "GUSD", "FRAX",
+        "PYUSD", "EURC", "CBETH",  # wrapped/staking tokens
+        "WBTC", "WETH",  # wrapped (trade the underlying instead)
+    }
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "CryptoScalper/3.1",
+        })
+        self._last_scan_time = 0
+        self._cached_pairs = []
+
+    def scan(self) -> list[str]:
+        """Scan Coinbase for all liquid USD trading pairs.
+
+        Returns a list of pair IDs sorted by 24h volume (highest first).
+        Uses cached result if within refresh interval.
+        """
+        now = time.time()
+        refresh = self.config.get("pair_refresh_interval_sec", 3600)
+        if self._cached_pairs and (now - self._last_scan_time) < refresh:
+            return self._cached_pairs
+
+        logger.info("=== PAIR SCANNER: Discovering tradeable pairs from Coinbase ===")
+
+        # Step 1: Get all products from Coinbase
+        try:
+            resp = self.session.get(
+                f"{COINBASE_EXCHANGE_API}/products",
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Products API returned {resp.status_code}")
+                return self._cached_pairs or self.config.get("pairs", [])
+            products = resp.json()
+        except Exception as e:
+            logger.warning(f"Products API error: {e}")
+            return self._cached_pairs or self.config.get("pairs", [])
+
+        # Step 2: Filter to USD pairs that are online and not excluded
+        usd_pairs = []
+        for p in products:
+            pair_id = p.get("id", "")
+            quote = p.get("quote_currency", "")
+            base = p.get("base_currency", "")
+            status = p.get("status", "")
+
+            if quote != "USD":
+                continue
+            if status != "online":
+                continue
+            if base in self.EXCLUDED_BASES:
+                continue
+            # Skip pairs with "auction" in trading_disabled or similar flags
+            if p.get("trading_disabled", False):
+                continue
+            if p.get("cancel_only", False):
+                continue
+            if p.get("limit_only", False):
+                continue
+
+            usd_pairs.append(pair_id)
+
+        logger.info(f"  Found {len(usd_pairs)} USD pairs on Coinbase (online, not excluded)")
+
+        # Step 3: Fetch 24h stats for volume + spread filtering
+        # Coinbase has /products/{id}/stats for 24h volume
+        min_vol = self.config.get("min_24h_volume_usd", 500_000)
+        max_spread = self.config.get("max_spread_pct", 0.15)
+        qualified = []
+
+        # Batch: fetch stats for all pairs (with rate limiting)
+        for pair_id in usd_pairs:
+            try:
+                resp = self.session.get(
+                    f"{COINBASE_EXCHANGE_API}/products/{pair_id}/stats",
+                    timeout=8,
+                )
+                if resp.status_code != 200:
+                    continue
+                stats = resp.json()
+
+                volume_24h = float(stats.get("volume", 0))
+                last_price = float(stats.get("last", 0))
+                open_price = float(stats.get("open", 0))
+
+                # Volume in USD (Coinbase stats volume is in base currency)
+                price_for_vol = last_price if last_price > 0 else open_price
+                vol_usd = volume_24h * price_for_vol
+
+                if vol_usd < min_vol:
+                    continue
+
+                # Quick spread check via ticker
+                ticker_resp = self.session.get(
+                    f"{COINBASE_EXCHANGE_API}/products/{pair_id}/ticker",
+                    timeout=8,
+                )
+                spread_pct = 999
+                if ticker_resp.status_code == 200:
+                    ticker = ticker_resp.json()
+                    bid = float(ticker.get("bid", 0))
+                    ask = float(ticker.get("ask", 0))
+                    mid = (bid + ask) / 2
+                    if mid > 0 and bid > 0 and ask > 0:
+                        spread_pct = (ask - bid) / mid * 100
+
+                if spread_pct > max_spread:
+                    continue
+
+                qualified.append({
+                    "pair": pair_id,
+                    "volume_usd": vol_usd,
+                    "spread_pct": spread_pct,
+                    "price": price_for_vol,
+                })
+
+            except Exception as e:
+                logger.debug(f"  Stats error {pair_id}: {e}")
+                continue
+
+            time.sleep(0.05)  # Rate limit: ~20 req/sec
+
+        # Step 4: Sort by volume (most liquid first) and cap
+        qualified.sort(key=lambda x: x["volume_usd"], reverse=True)
+        max_pairs = self.config.get("max_pairs", 80)
+        qualified = qualified[:max_pairs]
+
+        result = [q["pair"] for q in qualified]
+        self._cached_pairs = result
+        self._last_scan_time = now
+
+        # Log results
+        logger.info(f"  Qualified: {len(result)} pairs (vol >= ${min_vol:,.0f}, spread <= {max_spread}%)")
+        for i, q in enumerate(qualified[:10]):
+            logger.info(f"    {i+1}. {q['pair']}: ${q['volume_usd']:,.0f} vol, {q['spread_pct']:.3f}% spread")
+        if len(qualified) > 10:
+            logger.info(f"    ... and {len(qualified) - 10} more")
+
+        return result
+
+
+# ================================================================
 # GLOBAL MARKET FILTERS (v3.0)
 # ================================================================
 
@@ -832,12 +1156,21 @@ class MarketContext:
     # Current price
     price: float = 0.0
     atr_5m: float = 0.0
+    atr_1h: float = 0.0             # 1H ATR for exit calculations (overcomes fees)
     atr_pct: float = 0.0            # ATR as % of price
     # v3.0 additions
     fear_greed: int = 50            # 0-100
     cusum_signal: str = ""          # "up", "down", or ""
     btc_vol_ratio: float = 1.0     # BTC vol vs average (>2 = elevated)
     is_pump: bool = False           # Pump detection flag
+    # v3.2 additions (signal quality improvements)
+    rsi_divergence: str = ""        # "bullish", "bearish", or ""
+    engulfing: str = ""             # "bullish", "bearish", or ""
+    atr_ratio: float = 1.0         # ATR expansion ratio (>1.2 = vol expanding)
+    swing_supports: list = field(default_factory=list)
+    swing_resistances: list = field(default_factory=list)
+    near_support: bool = False      # Price within 0.5% of a swing support
+    near_resistance: bool = False   # Price within 0.5% of a swing resistance
 
 
 # ================================================================
@@ -1046,6 +1379,41 @@ class SignalDetector:
             components.append("BTC_VOL_ELEVATED")
             reasons.append(f"BTC vol {ctx.btc_vol_ratio:.1f}x elevated — caution")
 
+        # --- 14. RSI DIVERGENCE (worth 2 points — strong reversal signal) ---
+        if ctx.rsi_divergence == "bullish":
+            score += 2
+            components.append("RSI_DIV_BULL")
+            reasons.append("Bullish RSI divergence (price lower low, RSI higher low)")
+        elif ctx.rsi_divergence == "bearish":
+            score -= 1  # Against buy
+            components.append("RSI_DIV_BEAR")
+
+        # --- 15. ENGULFING CANDLE PATTERN (worth 1 point) ---
+        if ctx.engulfing == "bullish":
+            score += 1
+            components.append("ENGULF_BULL")
+            reasons.append("Bullish engulfing candle pattern")
+        elif ctx.engulfing == "bearish":
+            score -= 1
+            components.append("ENGULF_BEAR")
+
+        # --- 16. SWING LEVEL SUPPORT (worth 1-2 points) ---
+        if ctx.near_support and ctx.hourly_trend in ("bullish", "neutral"):
+            pts = 2 if ctx.hourly_trend == "bullish" else 1
+            score += pts
+            components.append("SWING_SUPPORT")
+            reasons.append("Price near swing support level")
+
+        # --- 17. ATR EXPANSION FILTER (penalty for low vol) ---
+        if ctx.atr_ratio < self.config.get("atr_contraction_threshold", 0.8):
+            score -= 2  # Strong penalty: low vol = chop/fees eat everything
+            components.append("ATR_CONTRACTED")
+            reasons.append(f"ATR ratio {ctx.atr_ratio:.2f} — volatility contracted, skip")
+        elif ctx.atr_ratio > self.config.get("atr_expansion_threshold", 1.3):
+            score += 1  # Expanding vol = bigger moves, can overcome fees
+            components.append("ATR_EXPANDING")
+            reasons.append(f"ATR ratio {ctx.atr_ratio:.2f} — volatility expanding")
+
         # === BANDIT-WEIGHTED SCORE (auto-learned signal weighting) ===
         if self.bandit and components:
             weighted_bonus = 0
@@ -1149,6 +1517,33 @@ class SignalDetector:
             sell_components.append("CUSUM_DOWN")
             sell_reasons.append("CUSUM filter: meaningful downward move detected")
 
+        # 13. RSI bearish divergence
+        if ctx.rsi_divergence == "bearish":
+            sell_score += 2
+            sell_components.append("RSI_DIV_BEAR")
+            sell_reasons.append("Bearish RSI divergence (price higher high, RSI lower high)")
+
+        # 14. Bearish engulfing
+        if ctx.engulfing == "bearish":
+            sell_score += 1
+            sell_components.append("ENGULF_BEAR")
+            sell_reasons.append("Bearish engulfing candle pattern")
+
+        # 15. Swing resistance
+        if ctx.near_resistance and ctx.hourly_trend in ("bearish", "neutral"):
+            pts = 2 if ctx.hourly_trend == "bearish" else 1
+            sell_score += pts
+            sell_components.append("SWING_RESISTANCE")
+            sell_reasons.append("Price near swing resistance level")
+
+        # 16. ATR expansion/contraction for sell
+        if ctx.atr_ratio < self.config.get("atr_contraction_threshold", 0.8):
+            sell_score -= 2
+            sell_components.append("ATR_CONTRACTED")
+        elif ctx.atr_ratio > self.config.get("atr_expansion_threshold", 1.3):
+            sell_score += 1
+            sell_components.append("ATR_EXPANDING")
+
         # Bandit weighting for sell signals
         if self.bandit and sell_components:
             weighted_bonus = 0
@@ -1191,24 +1586,31 @@ class SignalDetector:
 
         grade = "A" if best_score >= 7 else "B" if best_score >= 5 else "C" if best_score >= 4 else "D"
 
-        # === HARD FILTERS: PUMP DETECTION & PANIC ===
+        # === HARD FILTERS: PUMP, PANIC, LOW-ADX RANGING ===
         if ctx.is_pump:
             logger.info(f"  {pair}: PUMP detected — skipping entry (exit liquidity risk)")
             return None
         if ctx.fear_greed > 0 and ctx.fear_greed < self.config.get("fear_greed_no_trade_zone", 10):
             logger.info(f"  {pair}: Fear & Greed={ctx.fear_greed} PANIC — no entries")
             return None
+        # Backtest finding: ranging regime has ~11% WR — require higher confluence
+        if ctx.regime == "ranging" and best_score < self.config.get("min_ranging_score", 5):
+            logger.debug(f"  {pair}: ranging regime, score {best_score} < {self.config.get('min_ranging_score', 5)} — skipping")
+            return None
 
         # === DYNAMIC ATR-BASED EXITS ===
+        # Use 1H ATR for exit levels (5m ATR is too small to overcome fees)
+        # Fall back to 5m ATR * 12 if 1H not available (approximate)
+        exit_atr = ctx.atr_1h if ctx.atr_1h > 0 else atr * 12
         # Widen stops when BTC vol is elevated (research: vol spillover)
         vol_adj = min(1.5, max(1.0, ctx.btc_vol_ratio)) if ctx.btc_vol_ratio > 1.5 else 1.0
 
         if best_side == "buy":
-            tp_price = price + atr * self.config["tp_atr_mult"] * vol_adj
-            sl_price = price - atr * self.config["sl_atr_mult"] * vol_adj
+            tp_price = price + exit_atr * self.config["tp_atr_mult"] * vol_adj
+            sl_price = price - exit_atr * self.config["sl_atr_mult"] * vol_adj
         else:  # sell
-            tp_price = price - atr * self.config["tp_atr_mult"] * vol_adj
-            sl_price = price + atr * self.config["sl_atr_mult"] * vol_adj
+            tp_price = price - exit_atr * self.config["tp_atr_mult"] * vol_adj
+            sl_price = price + exit_atr * self.config["sl_atr_mult"] * vol_adj
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -1220,7 +1622,7 @@ class SignalDetector:
             quality_grade=grade,
             price=price,
             rsi=rsi,
-            atr=atr,
+            atr=exit_atr,  # Store exit ATR (1H) for position management
             take_profit=round(tp_price, 6),
             stop_loss=round(sl_price, 6),
             regime=ctx.regime,
@@ -1289,6 +1691,8 @@ class CryptoScalper:
                     self.config[key] = val
         self.coinbase = CoinbaseDataClient()
         self.binance = BinanceDataClient()
+        # v3.1: Dynamic pair discovery
+        self.pair_scanner = PairScanner(self.config) if self.config.get("dynamic_pairs") else None
         # v3.0: Profit-maximizing filters
         self.fear_greed = FearGreedIndex()
         self.cusum = CUSUMFilter(threshold=self.config.get("cusum_threshold", 0.003))
@@ -1408,6 +1812,11 @@ class CryptoScalper:
                 else:
                     ctx.regime = "transitional"
 
+            # 1H ATR for exit calculations (overcomes fee structure)
+            atr_1h = calc_atr(highs_1h, lows_1h, closes_1h)
+            if atr_1h:
+                ctx.atr_1h = atr_1h
+
             # Volume profile from 1H candles
             vp = calc_volume_profile(candles_1h)
             if vp:
@@ -1440,7 +1849,7 @@ class CryptoScalper:
             ctx.fear_greed = fg["value"]
 
         # 5. v3.0: CUSUM filter — feed NEW 5M candle returns only (AFML: use HF returns)
-        candles_5m_brief = self.coinbase.get_candles(pair, "FIVE_MINUTE", limit=10)
+        candles_5m_brief = self.coinbase.get_candles(pair, "FIVE_MINUTE", num_candles=10)
         if candles_5m_brief and len(candles_5m_brief) >= 2:
             last_ts = self._last_cusum_ts.get(pair, 0)
             for i in range(1, len(candles_5m_brief)):
@@ -1474,6 +1883,45 @@ class CryptoScalper:
                 ctx.is_pump = True
                 logger.info(f"  {pair}: PUMP DETECTED — vol {curr_vol_1h/avg_vol_1h:.1f}x, "
                            f"price {price_chg_1h:+.2%}")
+
+        # 8. v3.2: RSI divergence from 5m candles
+        candles_5m = self.coinbase.get_candles(pair, "FIVE_MINUTE", num_candles=50)
+        if candles_5m and len(candles_5m) >= 35:
+            closes_5m = [c["close"] for c in candles_5m]
+            div = detect_rsi_divergence(closes_5m, period=14, lookback=15)
+            if div:
+                ctx.rsi_divergence = div
+
+        # 9. v3.2: Engulfing candle pattern
+        if candles_5m and len(candles_5m) >= 2:
+            eng = detect_engulfing(candles_5m)
+            if eng:
+                ctx.engulfing = eng
+
+        # 10. v3.2: Swing levels from 1H candles
+        if candles_1h and len(candles_1h) >= 10:
+            levels = find_swing_levels(candles_1h)
+            ctx.swing_supports = levels["support"]
+            ctx.swing_resistances = levels["resistance"]
+            price = candles_1h[-1]["close"]
+            if price > 0:
+                for s in ctx.swing_supports:
+                    if abs(price - s) / price < 0.005:
+                        ctx.near_support = True
+                        break
+                for r in ctx.swing_resistances:
+                    if abs(price - r) / price < 0.005:
+                        ctx.near_resistance = True
+                        break
+
+        # 11. v3.2: ATR expansion ratio
+        if candles_5m and len(candles_5m) >= 25:
+            highs_5m = [c["high"] for c in candles_5m]
+            lows_5m = [c["low"] for c in candles_5m]
+            closes_5m = [c["close"] for c in candles_5m]
+            atr_r = calc_atr_ratio(highs_5m, lows_5m, closes_5m, fast_period=5, slow_period=20)
+            if atr_r is not None:
+                ctx.atr_ratio = atr_r
 
         return ctx
 
@@ -2006,6 +2454,7 @@ class CryptoScalper:
             f"{len(self.state.positions)} open | "
             f"PnL: ${self.state.total_pnl:+.2f} | "
             f"W/L: {self.state.winning_trades}/{self.state.total_trades - self.state.winning_trades} | "
+            f"Pairs:{len(self.config['pairs'])} | "
             f"F&G:{fg_val} | BTC-vol:{vol_r:.1f}x ---"
         )
 
@@ -2013,6 +2462,14 @@ class CryptoScalper:
         if self.state.positions:
             self.update_prices()
             self.check_exits()
+
+        # v3.1: Refresh pair universe dynamically
+        if self.pair_scanner:
+            scanned = self.pair_scanner.scan()
+            if scanned:
+                # Filter out auto-tuned removed pairs
+                active_pairs = [p for p in scanned if p not in self.state.removed_pairs]
+                self.config["pairs"] = active_pairs
 
         # Scan for new signals with full context
         all_signals = []
@@ -2077,9 +2534,10 @@ class CryptoScalper:
         roi = (s.total_pnl / s.starting_bankroll * 100) if s.starting_bankroll > 0 else 0
         drawdown = ((s.peak_bankroll - s.bankroll) / s.peak_bankroll * 100) if s.peak_bankroll > 0 else 0
 
+        pair_mode = "dynamic" if self.pair_scanner else "static"
         lines = [
             f"{'=' * 65}",
-            f"  CRYPTO SCALPER v3.0 (Confluence + Sentiment + Bandit)",
+            f"  CRYPTO SCALPER v3.1 ({pair_mode}: {len(self.config['pairs'])} pairs)",
             f"{'=' * 65}",
             f"  Bankroll:   ${s.bankroll:.2f} (started ${s.starting_bankroll:.2f})",
             f"  Total PnL:  ${s.total_pnl:+.2f} ({roi:+.1f}% ROI)",
@@ -2120,8 +2578,16 @@ class CryptoScalper:
     def run_loop(self):
         """Main trading loop."""
         interval = self.config["scan_interval_sec"]
-        logger.info(f"Starting crypto scalper v2.0 (scan every {interval}s)")
-        logger.info(f"Pairs: {', '.join(self.config['pairs'])}")
+        logger.info(f"Starting crypto scalper v3.1 (scan every {interval}s)")
+        if self.pair_scanner:
+            # Do initial pair discovery before first scan
+            scanned = self.pair_scanner.scan()
+            if scanned:
+                active_pairs = [p for p in scanned if p not in self.state.removed_pairs]
+                self.config["pairs"] = active_pairs
+            logger.info(f"Dynamic pairs: {len(self.config['pairs'])} discovered")
+        else:
+            logger.info(f"Static pairs: {', '.join(self.config['pairs'])}")
         logger.info(f"Min confluence: {self.config['min_confluence_score']}, "
                      f"Min grade: {self.config['min_signal_quality']}")
         logger.info(self.get_summary())
@@ -2152,7 +2618,7 @@ def setup_logging(verbose: bool = False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Crypto Scalping Bot v2.0")
+    parser = argparse.ArgumentParser(description="Crypto Scalping Bot v3.1")
     parser.add_argument("--bankroll", type=float, default=None)
     parser.add_argument("--scan-once", action="store_true")
     parser.add_argument("--status", action="store_true")
@@ -2179,6 +2645,7 @@ def main():
                 p = f"{p}-USD"
             pairs.append(p)
         SCALPER_CONFIG["pairs"] = pairs
+        SCALPER_CONFIG["dynamic_pairs"] = False  # Explicit pairs override dynamic discovery
     if args.min_score:
         SCALPER_CONFIG["min_confluence_score"] = args.min_score
 
@@ -2186,7 +2653,7 @@ def main():
         for f in [STATE_FILE, TRADE_LOG]:
             if os.path.exists(f):
                 os.remove(f)
-        print("Scalper v2.0 reset.")
+        print("Scalper v3.1 reset.")
         return
 
     scalper = CryptoScalper(SCALPER_CONFIG)
