@@ -1,0 +1,2210 @@
+"""Pro-grade crypto scalping bot v3.0 — research-backed, multi-signal confluence.
+
+Architecture:
+1. REGIME DETECTION — ADX classifies trending vs ranging, adapts strategy
+2. MULTI-TIMEFRAME — 1H trend direction, 5M entry timing
+3. CONFLUENCE SCORING — 0-13 scale with signal performance weighting
+4. ORDER BOOK IMBALANCE — confirms direction from Coinbase L2 book
+5. FUNDING RATE — extreme rates predict reversals (Binance public API)
+6. FAIR VALUE GAPS — institutional footprints in price action
+7. VOLUME PROFILE — POC/VAH/VAL as targets and support/resistance
+8. DYNAMIC ATR EXITS — volatility-scaled TP/SL, not fixed percentages
+9. FEAR & GREED FILTER — sentiment regime from alternative.me API
+10. CUSUM ENTRY FILTER — only trade on meaningful price moves (Lopez de Prado)
+11. PUMP DETECTION — skip coins with suspicious volume spikes
+12. CROSS-ASSET VOL TRACKER — BTC vol spillover early warning
+13. SIGNAL PERFORMANCE BANDIT — auto-weight signals by recent success
+
+Paper trades by default. Uses real market data from Coinbase + Binance.
+"""
+
+import argparse
+import csv
+import json
+import logging
+import math
+import os
+import sys
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+SCALPER_CONFIG = {
+    # Focused pair list: top 8 most liquid, best spreads
+    "pairs": [
+        "BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD",
+        "AVAX-USD", "LINK-USD", "XRP-USD", "SUI-USD",
+        "ADA-USD", "DOT-USD", "NEAR-USD", "MATIC-USD",
+        "UNI-USD", "ATOM-USD", "ARB-USD", "OP-USD",
+    ],
+    # Bankroll
+    "bankroll": 50.00,
+    "max_position_usd": 6.00,       # Moderate size, high turnover
+    "max_open_positions": 5,         # HFT: more concurrent positions
+    "max_exposure_pct": 0.70,        # 70% of bankroll at risk (higher turnover)
+    # Confluence requirements
+    "min_confluence_score": 3,       # HFT: lower bar, faster entries (was 4)
+    "min_signal_quality": "C",       # HFT: accept C-grade+ for speed (was B)
+    # Regime-adaptive thresholds
+    "adx_trending": 25,              # ADX > 25 = trending
+    "adx_ranging": 20,               # ADX < 20 = ranging
+    "rsi_oversold_trending": 35,     # More conservative in trends
+    "rsi_overbought_trending": 65,
+    "rsi_oversold_ranging": 28,      # Slightly relaxed for more signals (was 25)
+    "rsi_overbought_ranging": 72,    # Slightly relaxed for more signals (was 75)
+    "volume_spike_mult": 1.8,        # HFT: catch smaller volume moves (was 2.0)
+    "bb_squeeze_threshold": 0.012,   # HFT: tighter squeeze detection (was 0.015)
+    # Dynamic exits (ATR-based) — HFT: tighter targets, faster turnover
+    "tp_atr_mult": 1.8,             # HFT: quick take profit = 1.8x ATR (was 3.0)
+    "sl_atr_mult": 1.2,             # HFT: tight stop loss = 1.2x ATR (was 1.5)
+    "trailing_atr_mult": 1.5,       # HFT: tighter trail = 1.5x ATR (was 2.0)
+    "max_hold_hours": 2,             # HFT: max 2 hours, not 8 — in and out fast
+    "breakeven_at_1r": True,         # Move stop to breakeven at 1R profit
+    # Risk management
+    "kelly_fraction": 0.10,          # Slightly conservative per-trade
+    "max_daily_loss": -5.00,
+    "max_daily_trades": 30,          # HFT: many more trades per day (was 10)
+    "cooldown_after_loss_sec": 180,  # HFT: 3 min cooldown (was 10 min)
+    "max_consecutive_losses": 4,     # HFT: tolerate more losses before pausing (was 3)
+    # Scan frequency — HFT: scan every 10 seconds
+    "scan_interval_sec": 10,         # HFT: 10-sec scans (was 30)
+    "candle_granularity_entry": "FIVE_MINUTE",   # 5M for entry signals
+    "candle_granularity_trend": "ONE_HOUR",      # 1H for trend context
+    "candle_lookback": 50,
+    # Fees (Coinbase taker — worst case for paper trading)
+    "taker_fee_pct": 0.006,
+    "maker_fee_pct": 0.004,
+    # Order book imbalance thresholds — HFT: more sensitive
+    "ob_strong_buy": 0.20,           # HFT: lower threshold (was 0.25)
+    "ob_strong_sell": -0.20,         # HFT: lower threshold (was -0.25)
+    # Funding rate thresholds (from Binance perps)
+    "funding_extreme_high": 0.0005,  # > 0.05% = overheated longs
+    "funding_extreme_low": -0.0003,  # < -0.03% = oversold
+    # --- v3.0: Profit-maximizing filters ---
+    # Fear & Greed sentiment filter (alternative.me free API)
+    "fear_greed_extreme_fear": 20,   # < 20 = extreme fear -> mean reversion strongest
+    "fear_greed_extreme_greed": 80,  # > 80 = extreme greed -> momentum/caution
+    "fear_greed_no_trade_zone": 10,  # < 10 = panic, skip all entries
+    # CUSUM entry filter (Lopez de Prado): only trade on meaningful moves
+    "cusum_threshold": 0.002,        # HFT: 0.2% threshold, more sensitive (was 0.3%)
+    # Pump detection: skip suspicious volume spikes
+    "pump_volume_mult": 5.0,         # Volume > 5x 1H average = pump risk
+    "pump_price_change_pct": 0.03,   # + 3% in 1 hour = pump risk
+    # Cross-asset vol: BTC vol spillover warning
+    "vol_lookback_hours": 24,        # Hours of data for realized vol
+    "vol_spike_mult": 2.0,           # BTC vol > 2x average = widen stops / cautious
+    # Signal performance bandit: auto-weight signals
+    "bandit_lookback": 50,           # Rolling window for signal performance
+    "bandit_decay": 0.95,            # Exponential decay for older trades
+}
+
+# Coinbase Exchange API (free, no auth)
+COINBASE_EXCHANGE_API = "https://api.exchange.coinbase.com"
+
+# Binance Futures API (free, no auth for public endpoints)
+BINANCE_FAPI = "https://fapi.binance.com"
+
+GRANULARITY_SECONDS = {
+    "ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900,
+    "THIRTY_MINUTE": 1800, "ONE_HOUR": 3600, "TWO_HOUR": 7200,
+    "SIX_HOUR": 21600, "ONE_DAY": 86400,
+}
+
+# Coinbase pair → Binance symbol mapping
+def _to_binance_symbol(pair: str) -> str:
+    """BTC-USD → BTCUSDT"""
+    base = pair.replace("-USD", "").replace("-USDT", "")
+    return f"{base}USDT"
+
+# --- Data directory ---
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "crypto_trading")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+TRADE_LOG = os.path.join(DATA_DIR, "trades.csv")
+ANALYTICS_FILE = os.path.join(DATA_DIR, "analytics.jsonl")  # Rich trade analytics (JSONL: 1 record/line)
+TUNING_FILE = os.path.join(DATA_DIR, "tuning.json")         # Auto-tuned parameters
+
+
+# ================================================================
+# TECHNICAL INDICATORS
+# ================================================================
+
+def calc_rsi(closes: list[float], period: int = 14) -> Optional[float]:
+    """Relative Strength Index (Wilder's smoothing)."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(0, delta))
+        losses.append(max(0, -delta))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
+
+def calc_ema(values: list[float], period: int) -> Optional[float]:
+    """Exponential Moving Average."""
+    if len(values) < period:
+        return None
+    mult = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for val in values[period:]:
+        ema = (val - ema) * mult + ema
+    return ema
+
+
+def calc_ema_series(values: list[float], period: int) -> list[float]:
+    """Full EMA series for ADX calculation."""
+    if len(values) < period:
+        return []
+    mult = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    series = [ema]
+    for val in values[period:]:
+        ema = (val - ema) * mult + ema
+        series.append(ema)
+    return series
+
+
+def calc_adx(highs: list[float], lows: list[float], closes: list[float],
+             period: int = 14) -> Optional[float]:
+    """Average Directional Index — measures trend strength (0-100)."""
+    if len(closes) < period * 2:
+        return None
+
+    plus_dm, minus_dm, tr_list = [], [], []
+    for i in range(1, len(closes)):
+        high_diff = highs[i] - highs[i - 1]
+        low_diff = lows[i - 1] - lows[i]
+
+        pdm = high_diff if (high_diff > low_diff and high_diff > 0) else 0
+        mdm = low_diff if (low_diff > high_diff and low_diff > 0) else 0
+        plus_dm.append(pdm)
+        minus_dm.append(mdm)
+
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i - 1]),
+                 abs(lows[i] - closes[i - 1]))
+        tr_list.append(tr)
+
+    if len(tr_list) < period:
+        return None
+
+    # Wilder's smoothing
+    atr = sum(tr_list[:period]) / period
+    plus_di_smooth = sum(plus_dm[:period]) / period
+    minus_di_smooth = sum(minus_dm[:period]) / period
+
+    dx_values = []
+    for i in range(period, len(tr_list)):
+        atr = (atr * (period - 1) + tr_list[i]) / period
+        plus_di_smooth = (plus_di_smooth * (period - 1) + plus_dm[i]) / period
+        minus_di_smooth = (minus_di_smooth * (period - 1) + minus_dm[i]) / period
+
+        if atr == 0:
+            continue
+        plus_di = 100 * plus_di_smooth / atr
+        minus_di = 100 * minus_di_smooth / atr
+
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            continue
+        dx = 100 * abs(plus_di - minus_di) / di_sum
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return None
+
+    adx = sum(dx_values[:period]) / period
+    for dx in dx_values[period:]:
+        adx = (adx * (period - 1) + dx) / period
+
+    return adx
+
+
+def calc_macd(closes: list[float]) -> Optional[tuple[float, float, float]]:
+    """MACD (12,26,9). Returns (macd_line, signal_line, histogram).
+
+    Uses proper running EMA series (not re-seeded subsets).
+    """
+    if len(closes) < 35:
+        return None
+
+    # Build full EMA12 and EMA26 series
+    ema12_series = calc_ema_series(closes, 12)
+    ema26_series = calc_ema_series(closes, 26)
+    if not ema12_series or not ema26_series:
+        return None
+
+    # MACD line = EMA12 - EMA26 (aligned from the point both exist)
+    # EMA12 starts at index 12, EMA26 starts at index 26
+    # So MACD starts at index 26 (the later one)
+    offset = 26 - 12  # EMA12 has 14 more values than EMA26
+    macd_series = []
+    for i in range(len(ema26_series)):
+        macd_series.append(ema12_series[i + offset] - ema26_series[i])
+
+    if len(macd_series) < 9:
+        return None
+
+    # Signal line = 9-period EMA of MACD line
+    signal_series = calc_ema_series(macd_series, 9)
+    if not signal_series:
+        return None
+
+    macd_line = macd_series[-1]
+    signal = signal_series[-1]
+    return (macd_line, signal, macd_line - signal)
+
+
+def calc_macd_last_two_histograms(closes: list[float]) -> Optional[tuple[float, float]]:
+    """Return (prev_histogram, current_histogram) from a single continuous MACD run.
+
+    This avoids the alignment error of computing MACD on closes[:-1] vs closes
+    with independently seeded EMA series.
+    """
+    if len(closes) < 36:
+        return None
+
+    ema12_series = calc_ema_series(closes, 12)
+    ema26_series = calc_ema_series(closes, 26)
+    if not ema12_series or not ema26_series:
+        return None
+
+    offset = 26 - 12
+    macd_series = []
+    for i in range(len(ema26_series)):
+        macd_series.append(ema12_series[i + offset] - ema26_series[i])
+
+    if len(macd_series) < 10:
+        return None
+
+    signal_series = calc_ema_series(macd_series, 9)
+    if not signal_series or len(signal_series) < 2:
+        return None
+
+    prev_hist = macd_series[-2] - signal_series[-2]
+    curr_hist = macd_series[-1] - signal_series[-1]
+    return (prev_hist, curr_hist)
+
+
+def calc_bollinger(closes: list[float], period: int = 20, num_std: float = 2.0
+                   ) -> Optional[tuple[float, float, float, float]]:
+    """Bollinger Bands → (upper, middle, lower, bandwidth_pct)."""
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    middle = sum(window) / period
+    std = math.sqrt(sum((x - middle) ** 2 for x in window) / period)
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    bandwidth = (upper - lower) / middle if middle > 0 else 0
+    return (upper, middle, lower, bandwidth)
+
+
+def calc_atr(highs: list[float], lows: list[float], closes: list[float],
+             period: int = 14) -> Optional[float]:
+    """Average True Range."""
+    if len(closes) < period + 1:
+        return None
+    true_ranges = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i - 1]),
+                 abs(lows[i] - closes[i - 1]))
+        true_ranges.append(tr)
+    if len(true_ranges) < period:
+        return None
+    # Wilder's smoothing
+    atr = sum(true_ranges[:period]) / period
+    for i in range(period, len(true_ranges)):
+        atr = (atr * (period - 1) + true_ranges[i]) / period
+    return atr
+
+
+def calc_vwap(closes: list[float], volumes: list[float], highs: list[float],
+              lows: list[float]) -> Optional[float]:
+    """Volume-Weighted Average Price."""
+    if not closes or not volumes:
+        return None
+    typical_prices = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+    total_tp_vol = sum(tp * v for tp, v in zip(typical_prices, volumes))
+    total_vol = sum(volumes)
+    return total_tp_vol / total_vol if total_vol > 0 else None
+
+
+def detect_fvg(candles: list[dict]) -> list[dict]:
+    """Detect Fair Value Gaps (institutional footprints).
+
+    Bullish FVG: candle[i] low > candle[i-2] high (gap up)
+    Bearish FVG: candle[i] high < candle[i-2] low (gap down)
+    """
+    fvgs = []
+    for i in range(2, len(candles)):
+        # Bullish FVG
+        if candles[i]["low"] > candles[i - 2]["high"]:
+            fvgs.append({
+                "type": "bullish",
+                "top": candles[i]["low"],
+                "bottom": candles[i - 2]["high"],
+                "midpoint": (candles[i]["low"] + candles[i - 2]["high"]) / 2,
+                "size_pct": (candles[i]["low"] - candles[i - 2]["high"]) / candles[i - 2]["high"],
+                "candle_idx": i - 1,
+            })
+        # Bearish FVG
+        if candles[i]["high"] < candles[i - 2]["low"]:
+            fvgs.append({
+                "type": "bearish",
+                "top": candles[i - 2]["low"],
+                "bottom": candles[i]["high"],
+                "midpoint": (candles[i - 2]["low"] + candles[i]["high"]) / 2,
+                "size_pct": (candles[i - 2]["low"] - candles[i]["high"]) / candles[i - 2]["low"],
+                "candle_idx": i - 1,
+            })
+    return fvgs
+
+
+def calc_volume_profile(candles: list[dict], num_bins: int = 30
+                        ) -> Optional[dict]:
+    """Volume Profile: POC, Value Area High/Low.
+
+    Builds a histogram of volume at each price level,
+    finds the Point of Control (highest volume price) and
+    Value Area (70% of volume).
+    """
+    if len(candles) < 10:
+        return None
+
+    price_min = min(c["low"] for c in candles)
+    price_max = max(c["high"] for c in candles)
+    if price_max == price_min:
+        return None
+
+    bin_size = (price_max - price_min) / num_bins
+    bins = [0.0] * num_bins
+    bin_prices = [price_min + (i + 0.5) * bin_size for i in range(num_bins)]
+
+    for c in candles:
+        # Distribute volume across the candle's range
+        low_bin = int((c["low"] - price_min) / bin_size)
+        high_bin = int((c["high"] - price_min) / bin_size)
+        low_bin = max(0, min(low_bin, num_bins - 1))
+        high_bin = max(0, min(high_bin, num_bins - 1))
+        bins_in_range = high_bin - low_bin + 1
+        vol_per_bin = c["volume"] / bins_in_range if bins_in_range > 0 else 0
+        for b in range(low_bin, high_bin + 1):
+            bins[b] += vol_per_bin
+
+    # POC = bin with highest volume
+    poc_idx = max(range(num_bins), key=lambda i: bins[i])
+    poc = bin_prices[poc_idx]
+
+    # Value Area = 70% of total volume, expanding from POC
+    total_vol = sum(bins)
+    if total_vol == 0:
+        return None
+    target_vol = total_vol * 0.70
+    va_vol = bins[poc_idx]
+    lo, hi = poc_idx, poc_idx
+
+    while va_vol < target_vol and (lo > 0 or hi < num_bins - 1):
+        vol_above = bins[hi + 1] if hi + 1 < num_bins else 0
+        vol_below = bins[lo - 1] if lo - 1 >= 0 else 0
+        if vol_above >= vol_below and hi + 1 < num_bins:
+            hi += 1
+            va_vol += bins[hi]
+        elif lo - 1 >= 0:
+            lo -= 1
+            va_vol += bins[lo]
+        else:
+            break
+
+    return {
+        "poc": poc,
+        "vah": bin_prices[hi],
+        "val": bin_prices[lo],
+        "total_volume": total_vol,
+    }
+
+
+# ================================================================
+# MARKET DATA CLIENTS
+# ================================================================
+
+class CoinbaseDataClient:
+    """Fetches real-time market data from Coinbase public API."""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "CryptoScalper/2.0",
+        })
+        self._candle_cache = {}
+        self._book_cache = {}
+
+    def get_ticker(self, product_id: str) -> Optional[dict]:
+        """Get current price from Coinbase Exchange."""
+        try:
+            resp = self.session.get(
+                f"{COINBASE_EXCHANGE_API}/products/{product_id}/ticker",
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            return {
+                "price": float(data.get("price", 0)),
+                "volume_24h": float(data.get("volume", 0)),
+                "bid": float(data.get("bid", 0)),
+                "ask": float(data.get("ask", 0)),
+            }
+        except Exception as e:
+            logger.warning(f"Ticker error {product_id}: {e}")
+            return None
+
+    def get_candles(self, product_id: str, granularity: str = "FIVE_MINUTE",
+                    num_candles: int = 50) -> Optional[list[dict]]:
+        """Get OHLCV candles. Returns oldest-first."""
+        cache_key = f"{product_id}_{granularity}"
+        cached = self._candle_cache.get(cache_key)
+        if cached and time.time() - cached["time"] < 15:  # HFT: 15s cache (was 25s)
+            return cached["data"]
+
+        try:
+            gran_sec = GRANULARITY_SECONDS.get(granularity, 300)
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(seconds=gran_sec * num_candles)
+
+            resp = self.session.get(
+                f"{COINBASE_EXCHANGE_API}/products/{product_id}/candles",
+                params={
+                    "granularity": gran_sec,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return None
+
+            raw = resp.json()
+            if not raw:
+                return None
+
+            # Coinbase returns: [time, low, high, open, close, volume] newest-first
+            candles = []
+            for c in reversed(raw):
+                candles.append({
+                    "time": c[0],
+                    "open": float(c[3]),
+                    "high": float(c[2]),
+                    "low": float(c[1]),
+                    "close": float(c[4]),
+                    "volume": float(c[5]),
+                })
+
+            self._candle_cache[cache_key] = {"data": candles, "time": time.time()}
+            return candles
+        except Exception as e:
+            logger.warning(f"Candle error {product_id}: {e}")
+            return None
+
+    def get_order_book(self, product_id: str, depth_pct: float = 0.025) -> Optional[dict]:
+        """Get L2 order book for imbalance calculation.
+
+        Uses price-based depth (default 2.5% from mid) per hftbacktest research,
+        not a fixed level count, so imbalance is comparable across all pairs.
+        """
+        cache_key = product_id
+        cached = self._book_cache.get(cache_key)
+        if cached and time.time() - cached["time"] < 5:
+            return cached["data"]
+
+        try:
+            resp = self.session.get(
+                f"{COINBASE_EXCHANGE_API}/products/{product_id}/book",
+                params={"level": 2},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+
+            if not bids or not asks:
+                return None
+
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mid_price = (best_bid + best_ask) / 2
+
+            # Filter to within depth_pct of mid-price (research: 2.5%)
+            price_floor = mid_price * (1 - depth_pct)
+            price_ceil = mid_price * (1 + depth_pct)
+
+            bid_vol = sum(float(b[1]) for b in bids if float(b[0]) >= price_floor)
+            ask_vol = sum(float(a[1]) for a in asks if float(a[0]) <= price_ceil)
+
+            total = bid_vol + ask_vol
+            imbalance = (bid_vol - ask_vol) / total if total > 0 else 0
+
+            result = {
+                "bid_volume": bid_vol,
+                "ask_volume": ask_vol,
+                "imbalance": round(imbalance, 4),
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "mid_price": mid_price,
+                "spread_pct": round((best_ask - best_bid) / mid_price * 100, 4),
+            }
+
+            self._book_cache[cache_key] = {"data": result, "time": time.time()}
+            return result
+        except Exception as e:
+            logger.warning(f"Order book error {product_id}: {e}")
+            return None
+
+
+class BinanceDataClient:
+    """Fetches funding rate and open interest from Binance Futures (free, no auth)."""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json"})
+        self._funding_cache = {}
+        self._oi_cache = {}
+
+    def get_funding_rate(self, pair: str) -> Optional[dict]:
+        """Get current funding rate for a pair."""
+        symbol = _to_binance_symbol(pair)
+        cached = self._funding_cache.get(symbol)
+        if cached and time.time() - cached["time"] < 60:  # 1-min cache
+            return cached["data"]
+
+        try:
+            resp = self.session.get(
+                f"{BINANCE_FAPI}/fapi/v1/fundingRate",
+                params={"symbol": symbol, "limit": 3},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not data:
+                return None
+
+            current = data[-1]
+            result = {
+                "rate": float(current.get("fundingRate", 0)),
+                "time": int(current.get("fundingTime", 0)),
+                "rates_history": [float(d.get("fundingRate", 0)) for d in data],
+            }
+            self._funding_cache[symbol] = {"data": result, "time": time.time()}
+            return result
+        except Exception as e:
+            logger.warning(f"Funding rate error {pair}: {e}")
+            return None
+
+    def get_open_interest(self, pair: str) -> Optional[dict]:
+        """Get open interest for a pair."""
+        symbol = _to_binance_symbol(pair)
+        cached = self._oi_cache.get(symbol)
+        if cached and time.time() - cached["time"] < 60:
+            return cached["data"]
+
+        try:
+            resp = self.session.get(
+                f"{BINANCE_FAPI}/fapi/v1/openInterest",
+                params={"symbol": symbol},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            result = {
+                "open_interest": float(data.get("openInterest", 0)),
+                "symbol": data.get("symbol", symbol),
+            }
+            self._oi_cache[symbol] = {"data": result, "time": time.time()}
+            return result
+        except Exception as e:
+            logger.warning(f"OI error {pair}: {e}")
+            return None
+
+
+# ================================================================
+# GLOBAL MARKET FILTERS (v3.0)
+# ================================================================
+
+class FearGreedIndex:
+    """Fetch crypto Fear & Greed Index from alternative.me (free, no key)."""
+
+    def __init__(self):
+        self._cache = None
+        self._cache_time = 0
+        self._cache_ttl = 300  # 5 min cache (updates daily anyway)
+
+    def get(self) -> Optional[dict]:
+        """Returns {"value": 0-100, "classification": "Extreme Fear"|..., "timestamp": ...}"""
+        if self._cache and time.time() - self._cache_time < self._cache_ttl:
+            return self._cache
+        try:
+            resp = requests.get(
+                "https://api.alternative.me/fng/?limit=1",
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                return self._cache
+            data = resp.json().get("data", [{}])[0]
+            result = {
+                "value": int(data.get("value", 50)),
+                "classification": data.get("value_classification", "Neutral"),
+            }
+            self._cache = result
+            self._cache_time = time.time()
+            return result
+        except Exception as e:
+            logger.warning(f"Fear & Greed API error: {e}")
+            return self._cache
+
+
+class CUSUMFilter:
+    """Cumulative Sum filter (Lopez de Prado, AFML Ch. 2).
+
+    Only triggers when cumulative positive or negative returns exceed
+    a threshold. Filters out noise trades and only acts on meaningful moves.
+    """
+
+    def __init__(self, threshold: float = 0.003):
+        self.threshold = threshold
+        self._pos = {}  # pair -> cumulative positive sum
+        self._neg = {}  # pair -> cumulative negative sum
+
+    def update(self, pair: str, ret: float) -> Optional[str]:
+        """Feed a return. Returns 'up'/'down' when threshold breached, else None."""
+        pos = self._pos.get(pair, 0)
+        neg = self._neg.get(pair, 0)
+
+        pos = max(0, pos + ret)
+        neg = min(0, neg + ret)
+
+        self._pos[pair] = pos
+        self._neg[pair] = neg
+
+        if pos > self.threshold:
+            self._pos[pair] = 0  # Reset
+            return "up"
+        if neg < -self.threshold:
+            self._neg[pair] = 0  # Reset
+            return "down"
+        return None
+
+
+class CrossAssetVolTracker:
+    """Track BTC realized volatility to detect vol spillover to altcoins.
+
+    Research (SSRN 5048674): BTC vol spikes predict altcoin vol with a lag.
+    When BTC vol is elevated, widen stops or reduce position sizes.
+    """
+
+    def __init__(self):
+        self._btc_returns = deque(maxlen=288)  # 24h of 5-min returns
+        self._last_btc_price = None
+        self._cache_time = 0
+
+    def update_btc_price(self, price: float):
+        if self._last_btc_price and self._last_btc_price > 0:
+            ret = (price - self._last_btc_price) / self._last_btc_price
+            self._btc_returns.append(ret)
+        self._last_btc_price = price
+
+    @property
+    def btc_realized_vol(self) -> float:
+        """Annualized realized vol from 5-min returns."""
+        if len(self._btc_returns) < 20:
+            return 0
+        returns = list(self._btc_returns)
+        mean = sum(returns) / len(returns)
+        var = sum((r - mean) ** 2 for r in returns) / len(returns)
+        return math.sqrt(var) * math.sqrt(288 * 365)  # Annualize from 5-min
+
+    @property
+    def btc_vol_ratio(self) -> float:
+        """Current vol vs rolling average. >2.0 = elevated."""
+        if len(self._btc_returns) < 100:
+            return 1.0
+        # Compare recent (last 2h = 24 bars) vs full window
+        recent = list(self._btc_returns)[-24:]
+        full = list(self._btc_returns)
+        recent_var = sum(r**2 for r in recent) / len(recent)
+        full_var = sum(r**2 for r in full) / len(full)
+        if full_var == 0:
+            return 1.0
+        return math.sqrt(recent_var / full_var)
+
+
+class SignalBandit:
+    """Multi-armed bandit that tracks signal component performance.
+
+    Research (Taylor & Francis 2025): DQN strategy selection achieved 120x growth.
+    This is a simpler Thompson Sampling approach — weights signals by recent success.
+    """
+
+    def __init__(self, decay: float = 0.95):
+        self.decay = decay
+        self._wins = {}   # component -> decayed win count
+        self._total = {}  # component -> decayed total count
+
+    def record(self, components: list, won: bool):
+        """Record trade outcome for each signal component that fired."""
+        # Only decay components that are being updated (preserve history for infrequent signals)
+        for comp in components:
+            self._wins[comp] = self._wins.get(comp, 0) * self.decay
+            self._total[comp] = self._total.get(comp, 0) * self.decay
+            self._total[comp] += 1
+            if won:
+                self._wins[comp] = self._wins.get(comp, 0) + 1
+
+    def get_weight(self, component: str) -> float:
+        """Get performance weight for a signal component (0.5 - 1.5).
+
+        Returns 1.0 (neutral) if insufficient data. Winning signals get
+        boosted up to 1.5x, consistently losing signals get penalized to 0.5x.
+        """
+        total = self._total.get(component, 0)
+        if total < 3:
+            return 1.0  # Not enough data
+        wins = self._wins.get(component, 0)
+        win_rate = wins / total
+        # Map win_rate [0, 1] to weight [0.5, 1.5]
+        return 0.5 + win_rate
+
+    def get_all_weights(self) -> dict:
+        """Return all component weights for logging."""
+        result = {}
+        for comp in self._total:
+            result[comp] = round(self.get_weight(comp), 2)
+        return result
+
+
+# ================================================================
+# MARKET CONTEXT (regime + external signals)
+# ================================================================
+
+@dataclass
+class MarketContext:
+    """Aggregated market context for a single pair."""
+    pair: str
+    # Regime
+    regime: str = "unknown"         # "trending_up", "trending_down", "ranging", "volatile"
+    adx: float = 0.0
+    trend_direction: str = "neutral"  # "up", "down", "neutral"
+    # Hourly trend
+    hourly_ema_fast: float = 0.0    # 9 EMA on 1H
+    hourly_ema_slow: float = 0.0    # 20 EMA on 1H
+    hourly_rsi: float = 50.0
+    hourly_trend: str = "neutral"   # "bullish", "bearish", "neutral"
+    # Order book
+    ob_imbalance: float = 0.0       # -1 to +1
+    spread_pct: float = 0.0
+    # Funding
+    funding_rate: float = 0.0
+    funding_signal: str = "neutral"  # "overbought", "oversold", "neutral"
+    # Volume profile
+    poc: float = 0.0
+    vah: float = 0.0
+    val: float = 0.0
+    # Current price
+    price: float = 0.0
+    atr_5m: float = 0.0
+    atr_pct: float = 0.0            # ATR as % of price
+    # v3.0 additions
+    fear_greed: int = 50            # 0-100
+    cusum_signal: str = ""          # "up", "down", or ""
+    btc_vol_ratio: float = 1.0     # BTC vol vs average (>2 = elevated)
+    is_pump: bool = False           # Pump detection flag
+
+
+# ================================================================
+# SIGNAL DETECTION (confluence-based)
+# ================================================================
+
+GRADE_MAP = {"A": 4, "B": 3, "C": 2, "D": 1}
+MIN_GRADE = {"A": 4, "B": 3, "C": 2, "D": 1}
+
+
+@dataclass
+class Signal:
+    """A trading signal with confluence scoring."""
+    pair: str
+    side: str
+    signal_type: str
+    confluence_score: int    # 0-10
+    quality_grade: str       # A, B, C, D
+    price: float
+    rsi: float
+    atr: float
+    take_profit: float
+    stop_loss: float
+    regime: str
+    reasoning: str
+    components: list         # Which signals fired
+    timestamp: str
+
+
+class SignalDetector:
+    """Multi-signal confluence detector. Thinks like a pro trader."""
+
+    def __init__(self, config: dict = None, bandit: SignalBandit = None):
+        self.config = config or SCALPER_CONFIG
+        self.bandit = bandit
+
+    def analyze(self, pair: str, candles_5m: list[dict],
+                ctx: MarketContext) -> Optional[Signal]:
+        """Analyze a pair using all available data. Returns best signal or None."""
+        if not candles_5m or len(candles_5m) < 35:
+            return None
+
+        closes = [c["close"] for c in candles_5m]
+        highs = [c["high"] for c in candles_5m]
+        lows = [c["low"] for c in candles_5m]
+        volumes = [c["volume"] for c in candles_5m]
+        price = closes[-1]
+
+        # Calculate 5M indicators
+        rsi = calc_rsi(closes)
+        macd = calc_macd(closes)
+        bb = calc_bollinger(closes)
+        atr = calc_atr(highs, lows, closes)
+        vwap = calc_vwap(closes[-20:], volumes[-20:], highs[-20:], lows[-20:])
+        fvgs = detect_fvg(candles_5m[-10:])  # Recent FVGs only
+
+        if rsi is None or atr is None:
+            return None
+
+        # Store ATR in context
+        ctx.atr_5m = atr
+        ctx.atr_pct = atr / price if price > 0 else 0
+        ctx.price = price
+
+        # === CONFLUENCE SCORING ===
+        score = 0
+        components = []
+        reasons = []
+
+        # Determine regime-adaptive RSI thresholds
+        if ctx.regime.startswith("trending"):
+            rsi_os = self.config["rsi_oversold_trending"]
+            rsi_ob = self.config["rsi_overbought_trending"]
+        else:
+            rsi_os = self.config["rsi_oversold_ranging"]
+            rsi_ob = self.config["rsi_overbought_ranging"]
+
+        # --- 1. HOURLY TREND ALIGNMENT (worth 2 points) ---
+        if ctx.hourly_trend == "bullish":
+            score += 2
+            components.append("1H_TREND_UP")
+            reasons.append(f"1H trend bullish (EMA9>{ctx.hourly_ema_fast:.0f} > EMA20>{ctx.hourly_ema_slow:.0f})")
+        elif ctx.hourly_trend == "bearish":
+            score -= 2  # Penalty for counter-trend
+            components.append("1H_TREND_DOWN")
+
+        # --- 2. RSI SIGNAL (worth 1-2 points) ---
+        if rsi < rsi_os:
+            pts = 2 if rsi < rsi_os - 5 else 1
+            score += pts
+            components.append("RSI_OVERSOLD")
+            reasons.append(f"RSI={rsi:.0f} (oversold<{rsi_os})")
+        elif rsi > rsi_ob:
+            score -= 1  # Overbought = don't buy
+            components.append("RSI_OVERBOUGHT")
+
+        # --- 3. MACD MOMENTUM (worth 1 point) ---
+        if macd:
+            macd_line, signal_line, histogram = macd
+            hist_pair = calc_macd_last_two_histograms(closes)
+            if hist_pair:
+                prev_hist, curr_hist = hist_pair
+                if prev_hist < 0 and curr_hist > 0:
+                    score += 1
+                    components.append("MACD_BULL_CROSS")
+                    reasons.append(f"MACD bullish cross ({prev_hist:.4f}→{curr_hist:.4f})")
+                elif prev_hist > 0 and curr_hist < 0:
+                    score -= 1
+                    components.append("MACD_BEAR_CROSS")
+
+        # --- 4. ORDER BOOK IMBALANCE (worth 1-2 points) ---
+        if ctx.ob_imbalance > self.config["ob_strong_buy"]:
+            pts = 2 if ctx.ob_imbalance > 0.4 else 1
+            score += pts
+            components.append("OB_BID_HEAVY")
+            reasons.append(f"Order book bid-heavy ({ctx.ob_imbalance:+.2f})")
+        elif ctx.ob_imbalance < self.config["ob_strong_sell"]:
+            score -= 1
+            components.append("OB_ASK_HEAVY")
+
+        # --- 5. VOLUME SPIKE (worth 1 point) ---
+        avg_vol = sum(volumes[-20:-1]) / 19 if len(volumes) >= 20 else sum(volumes) / len(volumes)
+        curr_vol = volumes[-1]
+        if avg_vol > 0 and curr_vol > avg_vol * self.config["volume_spike_mult"]:
+            price_chg = (closes[-1] - closes[-2]) / closes[-2] if closes[-2] > 0 else 0
+            if price_chg > 0.001:  # Bullish volume spike
+                score += 1
+                components.append("VOL_SPIKE_BULL")
+                reasons.append(f"Volume {curr_vol / avg_vol:.1f}x avg, price +{price_chg:.2%}")
+            elif price_chg < -0.001:
+                score -= 1
+                components.append("VOL_SPIKE_BEAR")
+
+        # --- 6. BOLLINGER BAND POSITION (worth 1 point) ---
+        if bb:
+            upper, middle, lower, bandwidth = bb
+            if price <= lower:
+                score += 1
+                components.append("BB_LOWER_TOUCH")
+                reasons.append(f"Price at BB lower ({lower:.2f})")
+            elif price >= upper and bandwidth > self.config["bb_squeeze_threshold"]:
+                score -= 1  # At upper band in expanded market = risky buy
+                components.append("BB_UPPER_TOUCH")
+
+        # --- 7. FUNDING RATE CONTRARIAN (worth 1 point) ---
+        if ctx.funding_signal == "oversold":  # Negative funding = good for longs
+            score += 1
+            components.append("FUNDING_OVERSOLD")
+            reasons.append(f"Funding negative ({ctx.funding_rate:.4%}) = shorts paying")
+        elif ctx.funding_signal == "overbought":
+            score -= 1
+            components.append("FUNDING_OVERHEATED")
+
+        # --- 8. VWAP POSITION (worth 1 point) ---
+        if vwap:
+            if price > vwap and ctx.hourly_trend == "bullish":
+                score += 1
+                components.append("ABOVE_VWAP")
+                reasons.append(f"Price above VWAP ({vwap:.2f})")
+            elif price < vwap and ctx.hourly_trend == "bearish":
+                score -= 1
+                components.append("BELOW_VWAP_BEARISH")
+
+        # --- 9. FAIR VALUE GAP (worth 1 point) ---
+        bullish_fvgs = [f for f in fvgs if f["type"] == "bullish"
+                        and f["bottom"] <= price <= f["top"]]
+        if bullish_fvgs:
+            # Price is filling a bullish FVG — institutional support
+            score += 1
+            components.append("FVG_FILL")
+            fvg = bullish_fvgs[-1]
+            reasons.append(f"Filling bullish FVG ({fvg['bottom']:.2f}-{fvg['top']:.2f})")
+
+        # --- 10. VOLUME PROFILE (worth 1 point) ---
+        if ctx.val > 0 and price <= ctx.val * 1.005:
+            score += 1
+            components.append("AT_VAL")
+            reasons.append(f"Price near Value Area Low ({ctx.val:.2f})")
+        elif ctx.poc > 0 and abs(price - ctx.poc) / ctx.poc < 0.003:
+            score += 0  # Neutral at POC
+
+        # --- 11. FEAR & GREED SENTIMENT (worth 1 point) ---
+        if ctx.fear_greed > 0:
+            if ctx.fear_greed <= self.config.get("fear_greed_extreme_fear", 20):
+                # Extreme fear = contrarian buy signal (mean reversion strongest)
+                score += 1
+                components.append("SENTIMENT_FEAR")
+                reasons.append(f"Fear & Greed={ctx.fear_greed} (extreme fear, contrarian buy)")
+            elif ctx.fear_greed >= self.config.get("fear_greed_extreme_greed", 80):
+                # Extreme greed = caution, not a buy zone
+                score -= 1
+                components.append("SENTIMENT_GREED")
+
+        # --- 12. CUSUM CONFIRMATION (worth 1 point) ---
+        if ctx.cusum_signal == "up":
+            score += 1
+            components.append("CUSUM_UP")
+            reasons.append("CUSUM filter: meaningful upward move detected")
+        elif ctx.cusum_signal == "down":
+            score -= 1
+            components.append("CUSUM_DOWN")
+
+        # --- 13. BTC VOL SPILLOVER (penalty only) ---
+        if ctx.btc_vol_ratio > self.config.get("vol_spike_mult", 2.0):
+            score -= 1
+            components.append("BTC_VOL_ELEVATED")
+            reasons.append(f"BTC vol {ctx.btc_vol_ratio:.1f}x elevated — caution")
+
+        # === BANDIT-WEIGHTED SCORE (auto-learned signal weighting) ===
+        if self.bandit and components:
+            weighted_bonus = 0
+            for comp in components:
+                w = self.bandit.get_weight(comp)
+                if w != 1.0:
+                    # Adjust: signals with >60% win rate get +0.5, <40% get -0.5
+                    weighted_bonus += (w - 1.0)
+            score += round(weighted_bonus)
+
+        # === SELL SIGNAL SCORING ===
+        # Mirror: bearish components contribute positively to sell score
+        sell_score = 0
+        sell_components = []
+        sell_reasons = []
+
+        # 1. Hourly trend DOWN
+        if ctx.hourly_trend == "bearish":
+            sell_score += 2
+            sell_components.append("1H_TREND_DOWN")
+            sell_reasons.append(f"1H trend bearish (EMA9 < EMA20)")
+
+        # 2. RSI Overbought
+        if rsi > rsi_ob:
+            pts = 2 if rsi > rsi_ob + 5 else 1
+            sell_score += pts
+            sell_components.append("RSI_OVERBOUGHT")
+            sell_reasons.append(f"RSI={rsi:.0f} (overbought>{rsi_ob})")
+        elif rsi < rsi_os:
+            sell_score -= 1  # Oversold = don't sell
+
+        # 3. MACD Bear Cross
+        if macd:
+            hist_pair = calc_macd_last_two_histograms(closes)
+            if hist_pair:
+                prev_hist, curr_hist = hist_pair
+                if prev_hist > 0 and curr_hist < 0:
+                    sell_score += 1
+                    sell_components.append("MACD_BEAR_CROSS")
+                    sell_reasons.append(f"MACD bearish cross ({prev_hist:.4f}->{curr_hist:.4f})")
+
+        # 4. Order Book Ask Heavy
+        if ctx.ob_imbalance < self.config["ob_strong_sell"]:
+            pts = 2 if ctx.ob_imbalance < -0.4 else 1
+            sell_score += pts
+            sell_components.append("OB_ASK_HEAVY")
+            sell_reasons.append(f"Order book ask-heavy ({ctx.ob_imbalance:+.2f})")
+
+        # 5. Bearish Volume Spike
+        if avg_vol > 0 and curr_vol > avg_vol * self.config["volume_spike_mult"]:
+            price_chg = (closes[-1] - closes[-2]) / closes[-2] if closes[-2] > 0 else 0
+            if price_chg < -0.001:
+                sell_score += 1
+                sell_components.append("VOL_SPIKE_BEAR")
+                sell_reasons.append(f"Volume {curr_vol / avg_vol:.1f}x avg, price {price_chg:.2%}")
+
+        # 6. Bollinger Upper Touch
+        if bb:
+            upper, middle, lower, bandwidth = bb
+            if price >= upper and bandwidth > self.config["bb_squeeze_threshold"]:
+                sell_score += 1
+                sell_components.append("BB_UPPER_TOUCH")
+                sell_reasons.append(f"Price at BB upper ({upper:.2f})")
+
+        # 7. Funding Overheated (contrarian: extreme longs = short opportunity)
+        if ctx.funding_signal == "overbought":
+            sell_score += 1
+            sell_components.append("FUNDING_OVERHEATED")
+            sell_reasons.append(f"Funding positive ({ctx.funding_rate:.4%}) = longs paying")
+
+        # 8. Below VWAP in downtrend
+        if vwap and price < vwap and ctx.hourly_trend == "bearish":
+            sell_score += 1
+            sell_components.append("BELOW_VWAP_BEARISH")
+            sell_reasons.append(f"Price below VWAP ({vwap:.2f}) in downtrend")
+
+        # 9. Bearish FVG fill
+        bearish_fvgs = [f for f in fvgs if f["type"] == "bearish"
+                        and f["bottom"] <= price <= f["top"]]
+        if bearish_fvgs:
+            sell_score += 1
+            sell_components.append("FVG_FILL_BEAR")
+            fvg = bearish_fvgs[-1]
+            sell_reasons.append(f"Filling bearish FVG ({fvg['bottom']:.2f}-{fvg['top']:.2f})")
+
+        # 10. Volume profile: at VAH = resistance
+        if ctx.vah > 0 and price >= ctx.vah * 0.995:
+            sell_score += 1
+            sell_components.append("AT_VAH")
+            sell_reasons.append(f"Price near Value Area High ({ctx.vah:.2f})")
+
+        # 11. Extreme greed sentiment (contrarian)
+        if ctx.fear_greed > 0 and ctx.fear_greed >= self.config.get("fear_greed_extreme_greed", 80):
+            sell_score += 1
+            sell_components.append("SENTIMENT_GREED")
+            sell_reasons.append(f"Fear & Greed={ctx.fear_greed} (extreme greed, contrarian sell)")
+
+        # 12. CUSUM down signal
+        if ctx.cusum_signal == "down":
+            sell_score += 1
+            sell_components.append("CUSUM_DOWN")
+            sell_reasons.append("CUSUM filter: meaningful downward move detected")
+
+        # Bandit weighting for sell signals
+        if self.bandit and sell_components:
+            weighted_bonus = 0
+            for comp in sell_components:
+                w = self.bandit.get_weight(comp)
+                if w != 1.0:
+                    weighted_bonus += (w - 1.0)
+            sell_score += round(weighted_bonus)
+
+        # === QUALITY GRADING & SIGNAL SELECTION ===
+        # Pick the stronger direction
+        min_score = self.config["min_confluence_score"]
+        min_grade = self.config["min_signal_quality"]
+
+        best_side = None
+        best_score = 0
+        best_components = []
+        best_reasons = []
+
+        # Check buy signal
+        if score >= min_score:
+            buy_grade = "A" if score >= 7 and "1H_TREND_UP" in components else "B" if score >= 5 else "C" if score >= 4 else "D"
+            if GRADE_MAP.get(buy_grade, 0) >= GRADE_MAP.get(min_grade, 0):
+                best_side = "buy"
+                best_score = score
+                best_components = components
+                best_reasons = reasons
+
+        # Check sell signal
+        if sell_score >= min_score and sell_score > best_score:
+            sell_grade = "A" if sell_score >= 7 and "1H_TREND_DOWN" in sell_components else "B" if sell_score >= 5 else "C" if sell_score >= 4 else "D"
+            if GRADE_MAP.get(sell_grade, 0) >= GRADE_MAP.get(min_grade, 0):
+                best_side = "sell"
+                best_score = sell_score
+                best_components = sell_components
+                best_reasons = sell_reasons
+
+        if best_side is None:
+            return None
+
+        grade = "A" if best_score >= 7 else "B" if best_score >= 5 else "C" if best_score >= 4 else "D"
+
+        # === HARD FILTERS: PUMP DETECTION & PANIC ===
+        if ctx.is_pump:
+            logger.info(f"  {pair}: PUMP detected — skipping entry (exit liquidity risk)")
+            return None
+        if ctx.fear_greed > 0 and ctx.fear_greed < self.config.get("fear_greed_no_trade_zone", 10):
+            logger.info(f"  {pair}: Fear & Greed={ctx.fear_greed} PANIC — no entries")
+            return None
+
+        # === DYNAMIC ATR-BASED EXITS ===
+        # Widen stops when BTC vol is elevated (research: vol spillover)
+        vol_adj = min(1.5, max(1.0, ctx.btc_vol_ratio)) if ctx.btc_vol_ratio > 1.5 else 1.0
+
+        if best_side == "buy":
+            tp_price = price + atr * self.config["tp_atr_mult"] * vol_adj
+            sl_price = price - atr * self.config["sl_atr_mult"] * vol_adj
+        else:  # sell
+            tp_price = price - atr * self.config["tp_atr_mult"] * vol_adj
+            sl_price = price + atr * self.config["sl_atr_mult"] * vol_adj
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        return Signal(
+            pair=pair,
+            side=best_side,
+            signal_type=best_components[0] if best_components else "confluence",
+            confluence_score=best_score,
+            quality_grade=grade,
+            price=price,
+            rsi=rsi,
+            atr=atr,
+            take_profit=round(tp_price, 6),
+            stop_loss=round(sl_price, 6),
+            regime=ctx.regime,
+            reasoning=" | ".join(best_reasons),
+            components=best_components,
+            timestamp=now,
+        )
+
+
+# ================================================================
+# PAPER TRADING ENGINE
+# ================================================================
+
+@dataclass
+class ScalperState:
+    """Paper trading state."""
+    bankroll: float = 50.00
+    starting_bankroll: float = 50.00
+    peak_bankroll: float = 50.00
+    positions: list = field(default_factory=list)
+    closed_trades: list = field(default_factory=list)
+    total_trades: int = 0
+    winning_trades: int = 0
+    total_pnl: float = 0.0
+    daily_pnl: float = 0.0
+    daily_trade_count: int = 0
+    last_loss_time: float = 0.0
+    consecutive_losses: int = 0
+    last_reset_date: str = ""       # YYYY-MM-DD, for daily counter reset
+    last_scan: str = ""
+    removed_pairs: list = field(default_factory=list)  # Pairs removed by auto-tune
+    tuned_overrides: dict = field(default_factory=dict)  # Persisted auto-tune config overrides
+
+    @property
+    def open_exposure(self) -> float:
+        return sum(p.get("cost_usd", 0) for p in self.positions)
+
+    @property
+    def win_rate(self) -> float:
+        closed = len(self.closed_trades)
+        return self.winning_trades / closed if closed > 0 else 0.0
+
+    @property
+    def avg_pnl(self) -> float:
+        return self.total_pnl / self.total_trades if self.total_trades > 0 else 0.0
+
+
+class CryptoScalper:
+    """Pro-grade paper trading crypto scalper."""
+
+    def __init__(self, config: dict = None):
+        self.config = config or SCALPER_CONFIG
+        os.makedirs(DATA_DIR, exist_ok=True)
+        self.state = self._load_state()
+        # Re-apply auto-tune pair removals from previous runs
+        if self.state.removed_pairs:
+            for pair in self.state.removed_pairs:
+                if pair in self.config["pairs"]:
+                    self.config["pairs"].remove(pair)
+                    logger.info(f"Re-applying auto-tune: {pair} excluded")
+        # Re-apply tuned thresholds from previous sessions
+        if self.state.tuned_overrides:
+            for key, val in self.state.tuned_overrides.items():
+                if key in self.config:
+                    logger.info(f"Re-applying tuned: {key}={val}")
+                    self.config[key] = val
+        self.coinbase = CoinbaseDataClient()
+        self.binance = BinanceDataClient()
+        # v3.0: Profit-maximizing filters
+        self.fear_greed = FearGreedIndex()
+        self.cusum = CUSUMFilter(threshold=self.config.get("cusum_threshold", 0.003))
+        self._last_cusum_ts = {}  # pair -> last candle timestamp fed to CUSUM
+        self.vol_tracker = CrossAssetVolTracker()
+        self.bandit = SignalBandit(decay=self.config.get("bandit_decay", 0.95))
+        self.detector = SignalDetector(self.config, bandit=self.bandit)
+
+    def _load_state(self) -> ScalperState:
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE) as f:
+                    content = f.read().strip()
+                if not content:
+                    logger.warning("State file empty, starting fresh")
+                    return ScalperState(
+                        bankroll=self.config["bankroll"],
+                        starting_bankroll=self.config["bankroll"],
+                        peak_bankroll=self.config["bankroll"],
+                    )
+                data = json.loads(content)
+                known = {f.name for f in ScalperState.__dataclass_fields__.values()}
+                return ScalperState(**{k: v for k, v in data.items() if k in known})
+            except json.JSONDecodeError as e:
+                logger.error(f"State file corrupt: {e}. Remove {STATE_FILE} to reset.")
+                raise SystemExit(f"FATAL: corrupt state file: {STATE_FILE}")
+            except Exception as e:
+                logger.warning(f"Could not load state: {e}")
+        return ScalperState(
+            bankroll=self.config["bankroll"],
+            starting_bankroll=self.config["bankroll"],
+            peak_bankroll=self.config["bankroll"],
+        )
+
+    def _save_state(self):
+        # Atomic write: temp file + rename (prevents corruption on crash/kill)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(asdict(self.state), f, indent=2)
+        os.replace(tmp, STATE_FILE)
+
+    def _log_trade(self, action: str, data: dict):
+        with open(TRADE_LOG, "a", newline="") as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow([
+                    "timestamp", "action", "pair", "side", "price",
+                    "shares", "cost_usd", "pnl", "signal_type",
+                    "confluence_score", "quality_grade", "regime",
+                    "rsi", "reasoning",
+                ])
+            writer.writerow([
+                datetime.now(timezone.utc).isoformat(),
+                action, data.get("pair", ""), data.get("side", ""),
+                data.get("price", 0), data.get("shares", 0),
+                data.get("cost_usd", 0), data.get("pnl", 0),
+                data.get("signal_type", ""),
+                data.get("confluence_score", 0),
+                data.get("quality_grade", ""),
+                data.get("regime", ""),
+                data.get("rsi", 0),
+                data.get("reasoning", "")[:120],
+            ])
+
+    def _build_market_context(self, pair: str) -> Optional[MarketContext]:
+        """Build full market context for a pair: regime, trend, book, funding.
+
+        Returns None if critical data (1H candles) is unavailable — skips pair.
+        """
+        ctx = MarketContext(pair=pair)
+
+        # 1. Fetch 1H candles for trend/regime (REQUIRED — skip pair if missing)
+        candles_1h = self.coinbase.get_candles(
+            pair, granularity="ONE_HOUR", num_candles=50
+        )
+        if not candles_1h or len(candles_1h) < 30:
+            logger.debug(f"  {pair}: skipping — insufficient 1H data")
+            return None
+
+        if candles_1h and len(candles_1h) >= 30:
+            closes_1h = [c["close"] for c in candles_1h]
+            highs_1h = [c["high"] for c in candles_1h]
+            lows_1h = [c["low"] for c in candles_1h]
+
+            # Hourly EMAs
+            ema9 = calc_ema(closes_1h, 9)
+            ema20 = calc_ema(closes_1h, 20)
+            rsi_1h = calc_rsi(closes_1h)
+
+            if ema9 and ema20:
+                ctx.hourly_ema_fast = ema9
+                ctx.hourly_ema_slow = ema20
+                if ema9 > ema20 and closes_1h[-1] > ema9:
+                    ctx.hourly_trend = "bullish"
+                elif ema9 < ema20 and closes_1h[-1] < ema9:
+                    ctx.hourly_trend = "bearish"
+                else:
+                    ctx.hourly_trend = "neutral"
+
+            if rsi_1h:
+                ctx.hourly_rsi = rsi_1h
+
+            # ADX for regime
+            adx = calc_adx(highs_1h, lows_1h, closes_1h)
+            if adx is not None:
+                ctx.adx = adx
+                if adx > self.config["adx_trending"]:
+                    if ctx.hourly_trend == "bullish":
+                        ctx.regime = "trending_up"
+                    elif ctx.hourly_trend == "bearish":
+                        ctx.regime = "trending_down"
+                    else:
+                        ctx.regime = "trending"
+                    ctx.trend_direction = "up" if ctx.hourly_trend == "bullish" else "down"
+                elif adx < self.config["adx_ranging"]:
+                    ctx.regime = "ranging"
+                else:
+                    ctx.regime = "transitional"
+
+            # Volume profile from 1H candles
+            vp = calc_volume_profile(candles_1h)
+            if vp:
+                ctx.poc = vp["poc"]
+                ctx.vah = vp["vah"]
+                ctx.val = vp["val"]
+
+        time.sleep(0.1)
+
+        # 2. Order book
+        book = self.coinbase.get_order_book(pair)
+        if book:
+            ctx.ob_imbalance = book["imbalance"]
+            ctx.spread_pct = book["spread_pct"]
+
+        time.sleep(0.05)
+
+        # 3. Funding rate from Binance
+        funding = self.binance.get_funding_rate(pair)
+        if funding:
+            ctx.funding_rate = funding["rate"]
+            if funding["rate"] > self.config["funding_extreme_high"]:
+                ctx.funding_signal = "overbought"
+            elif funding["rate"] < self.config["funding_extreme_low"]:
+                ctx.funding_signal = "oversold"
+
+        # 4. v3.0: Fear & Greed Index (global, not per-pair)
+        fg = self.fear_greed.get()
+        if fg:
+            ctx.fear_greed = fg["value"]
+
+        # 5. v3.0: CUSUM filter — feed NEW 5M candle returns only (AFML: use HF returns)
+        candles_5m_brief = self.coinbase.get_candles(pair, "FIVE_MINUTE", limit=10)
+        if candles_5m_brief and len(candles_5m_brief) >= 2:
+            last_ts = self._last_cusum_ts.get(pair, 0)
+            for i in range(1, len(candles_5m_brief)):
+                candle = candles_5m_brief[i]
+                ts = candle.get("start", candle.get("time", 0))
+                if isinstance(ts, str):
+                    try:
+                        ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    except (ValueError, TypeError):
+                        ts = 0
+                if ts > last_ts and candles_5m_brief[i-1]["close"] > 0:
+                    ret = (candle["close"] - candles_5m_brief[i-1]["close"]) / candles_5m_brief[i-1]["close"]
+                    cusum_sig = self.cusum.update(pair, ret)
+                    if cusum_sig:
+                        ctx.cusum_signal = cusum_sig
+                    self._last_cusum_ts[pair] = ts
+
+        # 6. v3.0: BTC vol tracker (update BTC price, compute vol ratio)
+        if pair == "BTC-USD" and candles_1h:
+            self.vol_tracker.update_btc_price(candles_1h[-1]["close"])
+        ctx.btc_vol_ratio = self.vol_tracker.btc_vol_ratio
+
+        # 7. v3.0: Pump detection — volume spike + sharp price move in 1H
+        if candles_1h and len(candles_1h) >= 5:
+            avg_vol_1h = sum(c["volume"] for c in candles_1h[-5:-1]) / 4
+            curr_vol_1h = candles_1h[-1]["volume"]
+            price_chg_1h = (candles_1h[-1]["close"] - candles_1h[-2]["close"]) / candles_1h[-2]["close"]
+            if (avg_vol_1h > 0
+                and curr_vol_1h > avg_vol_1h * self.config.get("pump_volume_mult", 5.0)
+                and abs(price_chg_1h) > self.config.get("pump_price_change_pct", 0.03)):
+                ctx.is_pump = True
+                logger.info(f"  {pair}: PUMP DETECTED — vol {curr_vol_1h/avg_vol_1h:.1f}x, "
+                           f"price {price_chg_1h:+.2%}")
+
+        return ctx
+
+    def open_position(self, signal: Signal, ctx: MarketContext = None) -> bool:
+        """Open a paper position from a signal."""
+        # Risk checks
+        if len(self.state.positions) >= self.config["max_open_positions"]:
+            return False
+        if self.state.open_exposure >= self.state.bankroll * self.config["max_exposure_pct"]:
+            return False
+        if self.state.daily_pnl <= self.config["max_daily_loss"]:
+            logger.info("Daily loss limit hit")
+            return False
+        if self.state.daily_trade_count >= self.config["max_daily_trades"]:
+            return False
+        if time.time() - self.state.last_loss_time < self.config["cooldown_after_loss_sec"]:
+            return False
+        if self.state.consecutive_losses >= self.config["max_consecutive_losses"]:
+            # Allow recovery after 4 hours (not permanent halt)
+            hours_since_loss = (time.time() - self.state.last_loss_time) / 3600
+            if hours_since_loss < 4:
+                logger.info(f"Paused: {self.state.consecutive_losses} consecutive losses "
+                           f"({4 - hours_since_loss:.1f}h until resume)")
+                return False
+            else:
+                logger.info(f"Resuming after {hours_since_loss:.0f}h cooldown from {self.state.consecutive_losses} losses")
+                self.state.consecutive_losses = 0
+                self._save_state()
+
+        # No duplicate pairs
+        for pos in self.state.positions:
+            if pos["pair"] == signal.pair:
+                return False
+
+        # Position sizing: volatility-adjusted Kelly
+        atr_pct = signal.atr / signal.price if signal.price > 0 else 0.03
+        risk_per_trade = atr_pct * self.config["sl_atr_mult"]
+
+        # Kelly: f* = (p*b - q) / b where b = reward/risk, p = win probability
+        # Conservative: use fixed kelly fraction scaled by ATR
+        kelly_size = self.state.bankroll * self.config["kelly_fraction"]
+
+        # Scale down by volatility (riskier = smaller position)
+        vol_adj = min(1.0, 0.02 / max(atr_pct, 0.005))  # Normalize to 2% ATR
+
+        # Scale up by signal quality
+        quality_mult = {"A": 1.3, "B": 1.0, "C": 0.7, "D": 0.5}
+        q_mult = quality_mult.get(signal.quality_grade, 0.7)
+
+        position_size = min(
+            self.config["max_position_usd"],
+            kelly_size * vol_adj * q_mult,
+        )
+        position_size = max(1.0, round(position_size, 2))
+
+        shares = position_size / signal.price
+        pos_id = f"S{self.state.total_trades + 1:04d}"
+
+        position = {
+            "id": pos_id,
+            "pair": signal.pair,
+            "side": signal.side,
+            "entry_price": signal.price,
+            "shares": round(shares, 8),
+            "cost_usd": position_size,
+            "signal_type": signal.signal_type,
+            "confluence_score": signal.confluence_score,
+            "quality_grade": signal.quality_grade,
+            "regime": signal.regime,
+            "rsi_at_entry": signal.rsi,
+            "reasoning": signal.reasoning,
+            "take_profit": signal.take_profit,
+            "stop_loss": signal.stop_loss,
+            "atr_at_entry": signal.atr,
+            "peak_price": signal.price,
+            "trough_price": signal.price,
+            "current_price": signal.price,
+            "unrealized_pnl": 0.0,
+            "breakeven_moved": False,
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "components": signal.components,
+            # Rich context snapshot for analytics & auto-tuning
+            "entry_ob_imbalance": ctx.ob_imbalance if ctx else 0,
+            "entry_funding_rate": ctx.funding_rate if ctx else 0,
+            "entry_adx": ctx.adx if ctx else 0,
+            "entry_hourly_trend": ctx.hourly_trend if ctx else "unknown",
+            "entry_hourly_rsi": ctx.hourly_rsi if ctx else 50,
+            "entry_poc": ctx.poc if ctx else 0,
+            "entry_spread_pct": ctx.spread_pct if ctx else 0,
+            # v3.0 context
+            "entry_fear_greed": ctx.fear_greed if ctx else 50,
+            "entry_cusum_signal": ctx.cusum_signal if ctx else "",
+            "entry_btc_vol_ratio": ctx.btc_vol_ratio if ctx else 1.0,
+            "bandit_weights": self.bandit.get_all_weights(),
+        }
+
+        self.state.positions.append(position)
+        self.state.bankroll -= position_size
+        self.state.total_trades += 1
+        self.state.daily_trade_count += 1
+        self._save_state()
+        self._log_trade("OPEN", {**position, "price": signal.price, "pnl": 0})
+
+        def _fmt(p):
+            if p >= 1: return f"${p:,.2f}"
+            elif p >= 0.01: return f"${p:.4f}"
+            else: return f"${p:.8f}"
+
+        logger.info(
+            f"OPEN [{pos_id}] {signal.side.upper()} {signal.pair} @ {_fmt(signal.price)} | "
+            f"${position_size:.2f} | Grade:{signal.quality_grade} Score:{signal.confluence_score} | "
+            f"TP={_fmt(signal.take_profit)} SL={_fmt(signal.stop_loss)} | "
+            f"Regime:{signal.regime} | {signal.signal_type}"
+        )
+        return True
+
+    def update_prices(self):
+        """Update current prices for all open positions."""
+        for pos in self.state.positions:
+            ticker = self.coinbase.get_ticker(pos["pair"])
+            if ticker and ticker.get("price", 0) > 0:
+                new_price = ticker["price"]
+                pos["current_price"] = new_price
+                side = pos.get("side", "buy")
+                if side == "buy":
+                    pos["unrealized_pnl"] = round(
+                        (new_price - pos["entry_price"]) * pos["shares"], 4
+                    )
+                else:  # sell
+                    pos["unrealized_pnl"] = round(
+                        (pos["entry_price"] - new_price) * pos["shares"], 4
+                    )
+                if new_price > pos.get("peak_price", pos["entry_price"]):
+                    pos["peak_price"] = new_price
+                if new_price < pos.get("trough_price", pos["entry_price"]):
+                    pos["trough_price"] = new_price
+            time.sleep(0.1)
+        self._save_state()
+
+    def check_exits(self):
+        """Check exit conditions with pro-grade logic."""
+        to_close = []
+
+        for pos in self.state.positions:
+            current = pos.get("current_price", pos["entry_price"])
+            entry = pos["entry_price"]
+            atr = pos.get("atr_at_entry", entry * 0.02)
+            side = pos.get("side", "buy")
+            is_long = (side == "buy")
+
+            # 1. TAKE PROFIT (ATR-based, direction-aware)
+            if is_long and current >= pos["take_profit"]:
+                to_close.append((pos, "take_profit", current))
+                continue
+            elif not is_long and current <= pos["take_profit"]:
+                to_close.append((pos, "take_profit", current))
+                continue
+
+            # 2. STOP LOSS (ATR-based, direction-aware)
+            if is_long and current <= pos["stop_loss"]:
+                to_close.append((pos, "stop_loss", current))
+                continue
+            elif not is_long and current >= pos["stop_loss"]:
+                to_close.append((pos, "stop_loss", current))
+                continue
+
+            # 3. BREAKEVEN STOP: move stop to entry after 1R profit
+            if self.config["breakeven_at_1r"] and not pos.get("breakeven_moved"):
+                one_r = atr * self.config["sl_atr_mult"]
+                if is_long and current >= entry + one_r:
+                    pos["stop_loss"] = round(entry + atr * 0.2, 6)  # Slightly above entry
+                    pos["breakeven_moved"] = True
+                    logger.info(f"[{pos['id']}] Moved stop to breakeven+")
+                elif not is_long and current <= entry - one_r:
+                    pos["stop_loss"] = round(entry - atr * 0.2, 6)  # Slightly below entry
+                    pos["breakeven_moved"] = True
+                    logger.info(f"[{pos['id']}] Moved stop to breakeven+")
+
+            # 4. TRAILING STOP: direction-aware ratcheting
+            trail_distance = atr * self.config["trailing_atr_mult"]
+            if is_long:
+                peak = pos.get("peak_price", entry)
+                trailing_stop = peak - trail_distance
+                if trailing_stop > pos["stop_loss"]:
+                    pos["stop_loss"] = round(trailing_stop, 6)
+                    logger.debug(f"[{pos['id']}] Trail ratcheted stop to {trailing_stop:.6f}")
+                    continue
+                if current < pos["stop_loss"] and pos["stop_loss"] > entry:
+                    to_close.append((pos, "trailing_stop", current))
+                    continue
+            else:
+                trough = pos.get("trough_price", entry)
+                trailing_stop = trough + trail_distance
+                if trailing_stop < pos["stop_loss"]:
+                    pos["stop_loss"] = round(trailing_stop, 6)
+                    logger.debug(f"[{pos['id']}] Trail ratcheted stop to {trailing_stop:.6f}")
+                    continue
+                if current > pos["stop_loss"] and pos["stop_loss"] < entry:
+                    to_close.append((pos, "trailing_stop", current))
+                    continue
+
+            # 5. TIME EXIT
+            try:
+                opened = datetime.fromisoformat(pos["opened_at"])
+                elapsed_h = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+                if elapsed_h > self.config["max_hold_hours"]:
+                    to_close.append((pos, "time_exit", current))
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        for pos, reason, price in to_close:
+            self.close_position(pos, price, reason)
+
+    def close_position(self, pos: dict, exit_price: float, reason: str):
+        """Close a position and record P&L."""
+        side = pos.get("side", "buy")
+        if side == "buy":
+            gross_pnl = (exit_price - pos["entry_price"]) * pos["shares"]
+        else:  # sell
+            gross_pnl = (pos["entry_price"] - exit_price) * pos["shares"]
+        fee_pct = self.config["taker_fee_pct"]
+        entry_fee = pos["cost_usd"] * fee_pct
+        exit_value = exit_price * pos["shares"]
+        exit_fee = exit_value * fee_pct
+        total_fees = entry_fee + exit_fee
+        pnl = round(gross_pnl - total_fees, 4)
+
+        self.state.bankroll += pos["cost_usd"] + pnl
+        self.state.total_pnl += pnl
+        self.state.daily_pnl += pnl
+
+        if pnl > 0:
+            self.state.winning_trades += 1
+            self.state.consecutive_losses = 0
+        else:
+            self.state.last_loss_time = time.time()
+            self.state.consecutive_losses += 1
+
+        if self.state.bankroll > self.state.peak_bankroll:
+            self.state.peak_bankroll = self.state.bankroll
+
+        pnl_pct = (pnl / pos["cost_usd"]) * 100 if pos["cost_usd"] > 0 else 0
+        hold_time = ""
+        try:
+            opened = datetime.fromisoformat(pos["opened_at"])
+            mins = (datetime.now(timezone.utc) - opened).total_seconds() / 60
+            if mins >= 60:
+                hold_time = f" ({mins / 60:.1f}h)"
+            else:
+                hold_time = f" ({mins:.0f}m)"
+        except (ValueError, TypeError):
+            pass
+
+        closed = {
+            **pos,
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "pnl_pct": round(pnl_pct, 2),
+            "fees": round(total_fees, 4),
+            "reason": reason,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.state.closed_trades.append(closed)
+        # Cap closed trades in memory/state to prevent unbounded growth on 24/7 server
+        MAX_CLOSED_IN_STATE = 500
+        if len(self.state.closed_trades) > MAX_CLOSED_IN_STATE:
+            self.state.closed_trades = self.state.closed_trades[-MAX_CLOSED_IN_STATE:]
+        self.state.positions = [p for p in self.state.positions if p["id"] != pos["id"]]
+        self._save_state()
+        self._log_trade("CLOSE", {**pos, "price": exit_price, "pnl": pnl})
+
+        def _fmt(p):
+            if p >= 1: return f"${p:,.2f}"
+            elif p >= 0.01: return f"${p:.4f}"
+            else: return f"${p:.8f}"
+
+        icon = "+" if pnl >= 0 else ""
+        logger.info(
+            f"CLOSE [{pos['id']}] {pos['pair']} @ {_fmt(exit_price)} | "
+            f"PnL: {icon}${pnl:.4f} ({icon}{pnl_pct:.1f}%) | "
+            f"fees: ${total_fees:.4f} | {reason}{hold_time}"
+        )
+
+        # Record rich analytics for auto-tuning
+        self._record_analytics(closed)
+
+        # v3.0: Update signal performance bandit
+        self.bandit.record(
+            components=pos.get("components", []),
+            won=(pnl > 0),
+        )
+
+        # Auto-tune after every 20 closed trades
+        if len(self.state.closed_trades) > 0 and len(self.state.closed_trades) % 20 == 0:
+            self._auto_tune()
+
+    def _record_analytics(self, trade: dict):
+        """Record detailed trade analytics for learning.
+
+        Uses JSONL (one JSON object per line) for O(1) append instead of
+        reading and rewriting the entire file on every trade close.
+        """
+        record = {
+            "id": trade.get("id"),
+            "pair": trade.get("pair"),
+            "opened_at": trade.get("opened_at"),
+            "closed_at": trade.get("closed_at"),
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "pnl": trade.get("pnl"),
+            "pnl_pct": trade.get("pnl_pct"),
+            "fees": trade.get("fees"),
+            "reason": trade.get("reason"),
+            "won": trade.get("pnl", 0) > 0,
+            "signal_type": trade.get("signal_type"),
+            "confluence_score": trade.get("confluence_score"),
+            "quality_grade": trade.get("quality_grade"),
+            "components": trade.get("components", []),
+            "regime": trade.get("regime"),
+            "entry_ob_imbalance": trade.get("entry_ob_imbalance", 0),
+            "entry_funding_rate": trade.get("entry_funding_rate", 0),
+            "entry_adx": trade.get("entry_adx", 0),
+            "entry_hourly_trend": trade.get("entry_hourly_trend", ""),
+            "entry_hourly_rsi": trade.get("entry_hourly_rsi", 50),
+            "entry_rsi_5m": trade.get("rsi_at_entry", 0),
+            "entry_atr": trade.get("atr_at_entry", 0),
+            "entry_spread_pct": trade.get("entry_spread_pct", 0),
+            # v3.0 context
+            "entry_fear_greed": trade.get("entry_fear_greed", 50),
+            "entry_cusum_signal": trade.get("entry_cusum_signal", ""),
+            "entry_btc_vol_ratio": trade.get("entry_btc_vol_ratio", 1.0),
+            "bandit_weights": trade.get("bandit_weights", {}),
+        }
+        with open(ANALYTICS_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _auto_tune(self):
+        """Auto-tune parameters based on closed trade performance.
+
+        Analyzes win rate by: signal component, regime, quality grade, pair.
+        Adjusts confluence threshold and component weights based on what works.
+        """
+        trades = self.state.closed_trades
+        if len(trades) < 20:
+            return
+
+        logger.info(f"=== AUTO-TUNE: Analyzing {len(trades)} trades ===")
+
+        # --- Win rate by confluence component ---
+        component_stats = {}
+        for t in trades:
+            won = t.get("pnl", 0) > 0
+            for comp in t.get("components", []):
+                if comp not in component_stats:
+                    component_stats[comp] = {"wins": 0, "total": 0, "total_pnl": 0}
+                component_stats[comp]["total"] += 1
+                if won:
+                    component_stats[comp]["wins"] += 1
+                component_stats[comp]["total_pnl"] += t.get("pnl", 0)
+
+        # --- Win rate by regime ---
+        regime_stats = {}
+        for t in trades:
+            regime = t.get("regime", "unknown")
+            won = t.get("pnl", 0) > 0
+            if regime not in regime_stats:
+                regime_stats[regime] = {"wins": 0, "total": 0, "total_pnl": 0}
+            regime_stats[regime]["total"] += 1
+            if won:
+                regime_stats[regime]["wins"] += 1
+            regime_stats[regime]["total_pnl"] += t.get("pnl", 0)
+
+        # --- Win rate by grade ---
+        grade_stats = {}
+        for t in trades:
+            grade = t.get("quality_grade", "?")
+            won = t.get("pnl", 0) > 0
+            if grade not in grade_stats:
+                grade_stats[grade] = {"wins": 0, "total": 0, "total_pnl": 0}
+            grade_stats[grade]["total"] += 1
+            if won:
+                grade_stats[grade]["wins"] += 1
+            grade_stats[grade]["total_pnl"] += t.get("pnl", 0)
+
+        # --- Win rate by pair ---
+        pair_stats = {}
+        for t in trades:
+            pair = t.get("pair", "?")
+            won = t.get("pnl", 0) > 0
+            if pair not in pair_stats:
+                pair_stats[pair] = {"wins": 0, "total": 0, "total_pnl": 0}
+            pair_stats[pair]["total"] += 1
+            if won:
+                pair_stats[pair]["wins"] += 1
+            pair_stats[pair]["total_pnl"] += t.get("pnl", 0)
+
+        # --- Win rate by exit reason ---
+        exit_stats = {}
+        for t in trades:
+            reason = t.get("reason", "?")
+            won = t.get("pnl", 0) > 0
+            if reason not in exit_stats:
+                exit_stats[reason] = {"wins": 0, "total": 0, "total_pnl": 0}
+            exit_stats[reason]["total"] += 1
+            if won:
+                exit_stats[reason]["wins"] += 1
+            exit_stats[reason]["total_pnl"] += t.get("pnl", 0)
+
+        # --- Average OB imbalance on wins vs losses ---
+        win_obs = [t.get("entry_ob_imbalance", 0) for t in trades if t.get("pnl", 0) > 0]
+        loss_obs = [t.get("entry_ob_imbalance", 0) for t in trades if t.get("pnl", 0) <= 0]
+        avg_win_ob = sum(win_obs) / len(win_obs) if win_obs else 0
+        avg_loss_ob = sum(loss_obs) / len(loss_obs) if loss_obs else 0
+
+        # --- Adaptive tuning decisions ---
+        tuning = {
+            "analyzed_at": datetime.now(timezone.utc).isoformat(),
+            "total_trades": len(trades),
+            "overall_win_rate": sum(1 for t in trades if t.get("pnl", 0) > 0) / len(trades),
+            "overall_pnl": sum(t.get("pnl", 0) for t in trades),
+            "component_stats": {k: {**v, "win_rate": v["wins"] / v["total"] if v["total"] > 0 else 0}
+                               for k, v in component_stats.items()},
+            "regime_stats": {k: {**v, "win_rate": v["wins"] / v["total"] if v["total"] > 0 else 0}
+                           for k, v in regime_stats.items()},
+            "grade_stats": {k: {**v, "win_rate": v["wins"] / v["total"] if v["total"] > 0 else 0}
+                          for k, v in grade_stats.items()},
+            "pair_stats": {k: {**v, "win_rate": v["wins"] / v["total"] if v["total"] > 0 else 0}
+                         for k, v in pair_stats.items()},
+            "exit_stats": {k: {**v, "win_rate": v["wins"] / v["total"] if v["total"] > 0 else 0}
+                         for k, v in exit_stats.items()},
+            "avg_ob_imbalance_wins": round(avg_win_ob, 4),
+            "avg_ob_imbalance_losses": round(avg_loss_ob, 4),
+            "adjustments": [],
+        }
+
+        # --- Apply adjustments ---
+        overall_wr = tuning["overall_win_rate"]
+
+        # 1. If win rate < 40%, raise confluence threshold (be more selective)
+        if overall_wr < 0.40 and len(trades) >= 20:
+            old = self.config["min_confluence_score"]
+            self.config["min_confluence_score"] = min(old + 1, 7)
+            self.state.tuned_overrides["min_confluence_score"] = self.config["min_confluence_score"]
+            tuning["adjustments"].append(
+                f"Win rate {overall_wr:.0%} < 40%: raised min_confluence {old} → {self.config['min_confluence_score']}")
+
+        # 2. If win rate > 60%, can lower threshold to take more trades
+        if overall_wr > 0.60 and len(trades) >= 30:
+            old = self.config["min_confluence_score"]
+            self.config["min_confluence_score"] = max(old - 1, 3)
+            self.state.tuned_overrides["min_confluence_score"] = self.config["min_confluence_score"]
+            tuning["adjustments"].append(
+                f"Win rate {overall_wr:.0%} > 60%: lowered min_confluence {old} → {self.config['min_confluence_score']}")
+
+        # 3. If a regime has <30% win rate with 5+ trades, avoid it
+        for regime, stats in regime_stats.items():
+            wr = stats["wins"] / stats["total"] if stats["total"] > 0 else 0
+            if wr < 0.30 and stats["total"] >= 5:
+                tuning["adjustments"].append(
+                    f"Regime '{regime}' has {wr:.0%} win rate over {stats['total']} trades — POOR")
+
+        # 4. If OB imbalance is higher on wins, raise the threshold
+        if avg_win_ob > avg_loss_ob + 0.1 and len(win_obs) >= 5:
+            new_thresh = round((avg_win_ob + avg_loss_ob) / 2, 2)
+            if new_thresh > self.config["ob_strong_buy"]:
+                old = self.config["ob_strong_buy"]
+                self.config["ob_strong_buy"] = new_thresh
+                self.config["ob_strong_sell"] = -new_thresh
+                self.state.tuned_overrides["ob_strong_buy"] = new_thresh
+                self.state.tuned_overrides["ob_strong_sell"] = -new_thresh
+                tuning["adjustments"].append(
+                    f"OB imbalance: wins avg {avg_win_ob:.2f} vs losses {avg_loss_ob:.2f}. "
+                    f"Raised threshold {old} → {new_thresh}")
+
+        # 5. If a pair is consistently losing (>5 trades, <25% WR), remove it
+        for pair, stats in pair_stats.items():
+            wr = stats["wins"] / stats["total"] if stats["total"] > 0 else 0
+            if wr < 0.25 and stats["total"] >= 5:
+                if pair in self.config["pairs"]:
+                    self.config["pairs"].remove(pair)
+                    if pair not in self.state.removed_pairs:
+                        self.state.removed_pairs.append(pair)
+                    tuning["adjustments"].append(
+                        f"Removed {pair}: {wr:.0%} win rate over {stats['total']} trades")
+
+        # Log results
+        for adj in tuning["adjustments"]:
+            logger.info(f"  AUTO-TUNE: {adj}")
+        if not tuning["adjustments"]:
+            logger.info(f"  AUTO-TUNE: No adjustments needed (WR={overall_wr:.0%})")
+
+        # Log component performance
+        for comp, stats in sorted(component_stats.items(),
+                                   key=lambda x: x[1].get("total_pnl", 0), reverse=True):
+            wr = stats["wins"] / stats["total"] if stats["total"] > 0 else 0
+            logger.info(f"  Component {comp}: {wr:.0%} WR ({stats['total']} trades) "
+                        f"PnL: ${stats['total_pnl']:+.4f}")
+
+        # Save tuning report
+        tmp = TUNING_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(tuning, f, indent=2)
+        os.replace(tmp, TUNING_FILE)
+
+    def _check_daily_reset(self):
+        """Reset daily counters at midnight UTC."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.state.last_reset_date != today:
+            if self.state.last_reset_date:  # Not first run
+                logger.info(f"New day ({today}): resetting daily P&L and trade count")
+            self.state.daily_pnl = 0.0
+            self.state.daily_trade_count = 0
+            self.state.consecutive_losses = 0  # Fresh start each day
+            self.state.last_reset_date = today
+            self._save_state()
+
+    def scan_and_trade(self):
+        """Full scan cycle: context → exits → signals → trade."""
+        self._check_daily_reset()
+
+        # v3.0: Fetch global context once per scan
+        fg = self.fear_greed.get()
+        fg_val = fg["value"] if fg else "?"
+        vol_r = self.vol_tracker.btc_vol_ratio
+
+        logger.info(
+            f"--- SCAN {datetime.now(timezone.utc).strftime('%H:%M:%S')} | "
+            f"${self.state.bankroll:.2f} | "
+            f"{len(self.state.positions)} open | "
+            f"PnL: ${self.state.total_pnl:+.2f} | "
+            f"W/L: {self.state.winning_trades}/{self.state.total_trades - self.state.winning_trades} | "
+            f"F&G:{fg_val} | BTC-vol:{vol_r:.1f}x ---"
+        )
+
+        # Update existing positions first
+        if self.state.positions:
+            self.update_prices()
+            self.check_exits()
+
+        # Scan for new signals with full context
+        all_signals = []
+        for pair in self.config["pairs"]:
+            try:
+                # Build full market context (1H trend, order book, funding)
+                ctx = self._build_market_context(pair)
+                if ctx is None:
+                    continue  # Skip pair if critical data missing
+
+                # Get 5M candles for entry timing
+                candles_5m = self.coinbase.get_candles(
+                    pair,
+                    granularity=self.config["candle_granularity_entry"],
+                    num_candles=self.config["candle_lookback"],
+                )
+
+                if candles_5m:
+                    signal = self.detector.analyze(pair, candles_5m, ctx)
+                    if signal:
+                        all_signals.append((signal, ctx))
+                        logger.info(
+                            f"  SIGNAL: {pair} | Grade:{signal.quality_grade} "
+                            f"Score:{signal.confluence_score} | "
+                            f"Regime:{ctx.regime} | 1H:{ctx.hourly_trend} | "
+                            f"OB:{ctx.ob_imbalance:+.2f} | "
+                            f"Fund:{ctx.funding_rate:.4%} | "
+                            f"{signal.reasoning[:80]}"
+                        )
+                    else:
+                        logger.debug(
+                            f"  {pair}: regime={ctx.regime} 1H={ctx.hourly_trend} "
+                            f"OB={ctx.ob_imbalance:+.2f} fund={ctx.funding_rate:.4%} — no signal"
+                        )
+            except Exception as e:
+                logger.debug(f"  Error scanning {pair}: {e}")
+
+            time.sleep(0.08)  # HFT: faster inter-pair delay (was 0.15)
+
+        # Sort by confluence score (highest first), then by grade
+        all_signals.sort(
+            key=lambda s: (s[0].confluence_score, GRADE_MAP.get(s[0].quality_grade, 0)),
+            reverse=True
+        )
+
+        opened = 0
+        for signal, ctx in all_signals:
+            if self.open_position(signal, ctx):
+                opened += 1
+            if opened >= 2:  # HFT: up to 2 new positions per scan (was 1)
+                break
+
+        if all_signals:
+            logger.info(f"Signals: {len(all_signals)} qualified | Opened: {opened}")
+
+        self.state.last_scan = datetime.now(timezone.utc).isoformat()
+        self._save_state()
+
+    def get_summary(self) -> str:
+        """Human-readable summary."""
+        s = self.state
+        roi = (s.total_pnl / s.starting_bankroll * 100) if s.starting_bankroll > 0 else 0
+        drawdown = ((s.peak_bankroll - s.bankroll) / s.peak_bankroll * 100) if s.peak_bankroll > 0 else 0
+
+        lines = [
+            f"{'=' * 65}",
+            f"  CRYPTO SCALPER v3.0 (Confluence + Sentiment + Bandit)",
+            f"{'=' * 65}",
+            f"  Bankroll:   ${s.bankroll:.2f} (started ${s.starting_bankroll:.2f})",
+            f"  Total PnL:  ${s.total_pnl:+.2f} ({roi:+.1f}% ROI)",
+            f"  Daily PnL:  ${s.daily_pnl:+.2f}",
+            f"  Drawdown:   {drawdown:.1f}% from peak ${s.peak_bankroll:.2f}",
+            f"  Trades:     {s.total_trades} ({s.win_rate:.0%} win rate)",
+            f"  Avg PnL:    ${s.avg_pnl:+.4f}/trade",
+            f"  Open:       {len(s.positions)} (${s.open_exposure:.2f} exposed)",
+            f"  Streak:     {s.consecutive_losses} consecutive losses",
+            f"{'=' * 65}",
+        ]
+
+        if s.positions:
+            lines.append("  OPEN POSITIONS:")
+            for pos in s.positions:
+                upnl = pos.get("unrealized_pnl", 0)
+                pct = ((pos.get("current_price", 0) - pos["entry_price"]) / pos["entry_price"] * 100) if pos["entry_price"] > 0 else 0
+                lines.append(
+                    f"  [{pos['id']}] {pos['pair']} @ ${pos['entry_price']:,.4f} → "
+                    f"${pos.get('current_price', 0):,.4f} ({pct:+.1f}%) | "
+                    f"${upnl:+.4f} | {pos.get('quality_grade', '?')}{pos.get('confluence_score', 0)} "
+                    f"| {pos.get('regime', '?')}"
+                )
+
+        if s.closed_trades:
+            recent = s.closed_trades[-5:]
+            lines.append(f"\n  RECENT CLOSED ({len(s.closed_trades)} total):")
+            for t in reversed(recent):
+                lines.append(
+                    f"  [{t['id']}] {t['pair']} ${t['entry_price']:,.4f}→${t['exit_price']:,.4f} "
+                    f"${t['pnl']:+.4f} ({t.get('pnl_pct', 0):+.1f}%) {t['reason']} "
+                    f"| {t.get('quality_grade', '?')}{t.get('confluence_score', 0)}"
+                )
+
+        lines.append(f"{'=' * 65}")
+        return "\n".join(lines)
+
+    def run_loop(self):
+        """Main trading loop."""
+        interval = self.config["scan_interval_sec"]
+        logger.info(f"Starting crypto scalper v2.0 (scan every {interval}s)")
+        logger.info(f"Pairs: {', '.join(self.config['pairs'])}")
+        logger.info(f"Min confluence: {self.config['min_confluence_score']}, "
+                     f"Min grade: {self.config['min_signal_quality']}")
+        logger.info(self.get_summary())
+
+        self.scan_and_trade()
+
+        try:
+            while True:
+                time.sleep(interval)
+                self.scan_and_trade()
+        except KeyboardInterrupt:
+            logger.info("Scalper stopped")
+            print(self.get_summary())
+
+
+def setup_logging(verbose: bool = False):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(
+                os.path.join(DATA_DIR, "scalper.log"), mode="a",
+            ),
+        ],
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Crypto Scalping Bot v2.0")
+    parser.add_argument("--bankroll", type=float, default=None)
+    parser.add_argument("--scan-once", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--reset", action="store_true", help="Reset state (fresh start)")
+    parser.add_argument("--interval", type=int, default=None)
+    parser.add_argument("--pairs", type=str, default=None)
+    parser.add_argument("--min-score", type=int, default=None,
+                       help="Min confluence score (default: 4)")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    setup_logging(verbose=args.verbose)
+
+    if args.bankroll:
+        SCALPER_CONFIG["bankroll"] = args.bankroll
+    if args.interval:
+        SCALPER_CONFIG["scan_interval_sec"] = args.interval
+    if args.pairs:
+        pairs = []
+        for p in args.pairs.split(","):
+            p = p.strip().upper()
+            if "-" not in p:
+                p = f"{p}-USD"
+            pairs.append(p)
+        SCALPER_CONFIG["pairs"] = pairs
+    if args.min_score:
+        SCALPER_CONFIG["min_confluence_score"] = args.min_score
+
+    if args.reset:
+        for f in [STATE_FILE, TRADE_LOG]:
+            if os.path.exists(f):
+                os.remove(f)
+        print("Scalper v2.0 reset.")
+        return
+
+    scalper = CryptoScalper(SCALPER_CONFIG)
+
+    if args.status:
+        scalper._check_daily_reset()
+        if scalper.state.positions:
+            scalper.update_prices()
+        print(scalper.get_summary())
+        return
+
+    if args.scan_once:
+        scalper.scan_and_trade()
+        print(scalper.get_summary())
+        return
+
+    scalper.run_loop()
+
+
+if __name__ == "__main__":
+    main()

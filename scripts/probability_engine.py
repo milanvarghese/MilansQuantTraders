@@ -65,7 +65,7 @@ def ensemble_bucket_probability(
 
     n = len(ensemble_members)
     mean = sum(ensemble_members) / n
-    variance = sum((t - mean) ** 2 for t in ensemble_members) / n
+    variance = sum((t - mean) ** 2 for t in ensemble_members) / (n - 1) if n > 1 else 1.0
     std = math.sqrt(variance) if variance > 0 else 1.0
 
     # Silverman's rule of thumb: h = 1.06 * sigma * N^(-1/5)
@@ -107,10 +107,11 @@ def bucket_probability(
 
 
 def kelly_criterion(prob: float, market_price: float, fraction: float = None) -> float:
-    """Calculate Kelly criterion bet size as fraction of bankroll.
+    """Calculate fee-aware Kelly criterion bet size as fraction of bankroll.
 
-    Uses fractional Kelly (default quarter-Kelly) for conservative sizing.
-    Research recommends 0.15-0.25 for small bankrolls with uncertain edge.
+    Accounts for Polymarket's 2% winner fee on net winnings.
+    Uses fractional Kelly (default from config, adjusted by dynamic Kelly).
+    Research: Proskurnikov & Barmish (2023) — bet LESS when edge uncertain.
     """
     if fraction is None:
         fraction = CONFIG["kelly_fraction"]
@@ -118,12 +119,16 @@ def kelly_criterion(prob: float, market_price: float, fraction: float = None) ->
     if market_price <= 0 or market_price >= 1 or prob <= market_price:
         return 0.0
 
-    # Kelly formula for binary bets: f = (p * b - q) / b
-    # where b = (1 - price) / price (odds), p = prob, q = 1-p
-    b = (1.0 - market_price) / market_price
-    q = 1.0 - prob
-    kelly_full = (prob * b - q) / b
+    # Fee-aware Kelly: net win is reduced by fee_rate on winnings
+    fee_rate = CONFIG.get("fee_rate", 0.02)
+    net_win = (1.0 - market_price) * (1.0 - fee_rate)
+    loss = market_price
+    edge = prob * net_win - (1.0 - prob) * loss
 
+    if edge <= 0:
+        return 0.0
+
+    kelly_full = edge / net_win
     return max(0.0, kelly_full * fraction)
 
 

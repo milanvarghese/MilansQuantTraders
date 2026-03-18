@@ -107,10 +107,12 @@ class RiskManager:
         return RiskState()
 
     def _save_state(self):
-        """Persist state to disk."""
+        """Persist state to disk (atomic write to prevent corruption on crash)."""
         os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
-        with open(self.STATE_FILE, "w") as f:
+        tmp = self.STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(asdict(self.state), f, indent=2)
+        os.replace(tmp, self.STATE_FILE)
 
     def can_trade(self, amount_usd: float, market_meta: dict = None) -> tuple[bool, str]:
         """Check if a new trade of given size is allowed.
@@ -152,12 +154,13 @@ class RiskManager:
             self._save_state()
             return False, self.state.pause_reason
 
-        # 6. Drawdown auto-kill
+        # 6. Drawdown auto-kill (only at max level — graduated sizing in paper_trader)
         if self.state.drawdown_pct >= CONFIG["max_drawdown_pct"]:
             self.state.is_paused = True
             self.state.pause_reason = (
-                f"Drawdown limit hit: {self.state.drawdown_pct:.0%} "
-                f"(peak ${self.state.peak_bankroll:.2f} → ${self.state.bankroll:.2f})"
+                f"Drawdown KILL: {self.state.drawdown_pct:.0%} "
+                f"(peak ${self.state.peak_bankroll:.2f} -> ${self.state.bankroll:.2f}). "
+                f"Graduated sizing active at lower levels."
             )
             self._save_state()
             return False, self.state.pause_reason

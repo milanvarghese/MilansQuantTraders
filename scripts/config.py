@@ -13,18 +13,41 @@ CONFIG = {
     "max_open_positions": 15,      # Max 15 concurrent (laddering across buckets)
     "max_exposure_pct": 0.40,      # Max 40% of bankroll at risk
     "daily_loss_limit": -5.00,     # Auto-pause if -$5 on the day
-    "kelly_fraction": 0.20,        # 20% Kelly — conservative for $50 bankroll
+    "kelly_fraction": 0.10,        # Start 10% Kelly — increase via dynamic Kelly after CLV proven
     "scan_interval_min": 5,        # Scan every 5 min (catch forecast updates fast)
     "min_hours_to_resolution": 2,  # Trade up to 2hrs before resolution
     "sigma_c": 1.1,                # Forecast uncertainty (°C) — ~2°F
     "bankroll": 50.00,             # Starting trading capital in USDC
     "heartbeat_interval": 10,      # Seconds between heartbeats
-    # --- Advanced Risk Checks ---
-    "max_spread": 0.15,            # Skip markets with bid-ask spread > 15%
+    # --- Fee Structure ---
+    "fee_rate": 0.02,              # 2% fee on net winnings (Polymarket winner fee)
+    # --- Spread Control (research: must stay under 3c for small trades) ---
+    "max_spread": 0.03,            # Skip markets with bid-ask spread > 3 cents
     "min_liquidity_usd": 50.0,     # Skip markets with < $50 orderbook depth
-    "max_drawdown_pct": 0.25,      # Auto-kill if bankroll drops 25% from peak
+    # --- Graduated Drawdown Heat System ---
+    "drawdown_normal": 0.10,       # 0-10% drawdown: full sizing
+    "drawdown_warning": 0.15,      # 10-15%: reduce to 75% sizing
+    "drawdown_critical": 0.20,     # 15-20%: reduce to 50% sizing
+    "max_drawdown_pct": 0.25,      # 20-25%: reduce to 25% sizing. >25%: pause
     "max_consecutive_losses": 5,   # Pause after 5 straight losses
     "max_daily_trades": 30,        # Max trades per day (higher for laddering)
+    # --- Exit Logic ---
+    "exit_edge_reversal": True,    # Exit when edge reverses (current_price > estimated_prob)
+    "exit_trailing_stop": 0.10,    # Trailing stop: exit if price drops 10c from peak
+    "exit_time_hours": 48,         # Exit 48h before resolution (market gets efficient)
+    # --- Near-Expiry Harvesting ---
+    "near_expiry_entry_low": 0.88, # Optimal entry range for near-expiry (fee-adjusted)
+    "near_expiry_entry_high": 0.93,
+    "near_expiry_max_days": 2,     # Must resolve within 2 days
+    "near_expiry_min_volume": 10000,
+    # --- CLV Tracking ---
+    "clv_recalibrate_threshold": 50,  # Recalibrate model after 50 trades
+    # --- Dynamic Kelly (based on rolling CLV) ---
+    "dynamic_kelly_strong": 0.25,    # CLV > 10%: aggressive
+    "dynamic_kelly_moderate": 0.20,  # CLV > 5%
+    "dynamic_kelly_marginal": 0.15,  # CLV > 2%
+    "dynamic_kelly_default": 0.10,   # CLV unknown or < 2%
+    # --- Retry ---
     "cf_max_retries": 3,           # Cloudflare retry attempts
     "cf_base_delay": 2.0,          # Base delay for exponential backoff (seconds)
 }
