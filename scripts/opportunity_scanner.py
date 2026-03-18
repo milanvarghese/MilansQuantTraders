@@ -1005,6 +1005,25 @@ class MarketAnalyzer:
             if any(kw in title_lower for kw in ["above", "below", "before", "when will", "hit $"]):
                 continue
 
+            # Check individual market titles for cumulative patterns
+            # ">$X" or "by DATE" legs indicate thresholds, not mutually exclusive
+            leg_titles = [m.get("groupItemTitle", m.get("question", "")).lower() for m in markets]
+            is_cumulative = False
+            for lt in leg_titles:
+                if lt.startswith(">") or lt.startswith("<") or lt.startswith("above") or lt.startswith("below"):
+                    is_cumulative = True
+                    break
+                # "by <date>" pattern in leg titles (e.g., "by March 31, 2026")
+                if re.match(r'^by\s', lt):
+                    is_cumulative = True
+                    break
+            if is_cumulative:
+                continue
+
+            # Skip FDV/market-cap threshold events (cumulative even without "above" in title)
+            if any(kw in title_lower for kw in ["fdv", "market cap", "marketcap", "fully diluted"]):
+                continue
+
             # Collect YES prices for each market in the event
             legs = []
             total_cost = 0
