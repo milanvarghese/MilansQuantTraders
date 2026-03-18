@@ -353,6 +353,7 @@ class BacktestResult:
     by_regime: dict = field(default_factory=dict)
     by_grade: dict = field(default_factory=dict)
     by_exit_reason: dict = field(default_factory=dict)
+    by_side: dict = field(default_factory=dict)
 
 
 class ScalperBacktester:
@@ -849,6 +850,7 @@ class ScalperBacktester:
         result.by_regime = self._breakdown_by_key("regime")
         result.by_grade = self._breakdown_by_key("quality_grade")
         result.by_exit_reason = self._breakdown_by_key("reason")
+        result.by_side = self._breakdown_by_key("side")
 
         return result
 
@@ -1019,6 +1021,18 @@ def print_report(result: BacktestResult, config: dict):
             stats = result.by_grade[grade]
             print(f"  {grade:<8} {stats['total']:>6} "
                   f"{stats['win_rate']:>5.0%} ${stats['pnl']:>+9.4f}")
+
+    # Side breakdown (buy/sell)
+    if result.by_side:
+        print(f"\n  {'SIDE PERFORMANCE (LONG vs SHORT)':^50}")
+        print(f"  {'Side':<12} {'Trades':>6} {'Win%':>6} {'PnL':>10}")
+        print(f"  {'-' * 38}")
+        for side in ["buy", "sell"]:
+            if side in result.by_side:
+                stats = result.by_side[side]
+                label = "LONG" if side == "buy" else "SHORT"
+                print(f"  {label:<12} {stats['total']:>6} "
+                      f"{stats['win_rate']:>5.0%} ${stats['pnl']:>+9.4f}")
 
     # Exit reason breakdown
     print(f"\n  {'EXIT REASON':^50}")

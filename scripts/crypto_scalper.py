@@ -1,4 +1,4 @@
-"""Pro-grade crypto scalping bot v3.3 — research-backed, multi-signal confluence.
+"""Pro-grade crypto scalping bot v3.4 — research-backed, multi-signal confluence.
 
 Architecture:
 1. DYNAMIC PAIR DISCOVERY — scans Coinbase for all liquid USD pairs, refreshes hourly
@@ -6,7 +6,7 @@ Architecture:
 3. MULTI-TIMEFRAME — 1H trend direction, 5M entry timing
 4. CONFLUENCE SCORING — 0-17 scale with signal performance weighting
 5. ORDER BOOK IMBALANCE — confirms direction from Coinbase L2 book
-6. FUNDING RATE — extreme rates predict reversals (Binance public API)
+6. FUNDING RATE — extreme rates predict reversals (Binance -> dYdX -> OKX fallback)
 7. FAIR VALUE GAPS — institutional footprints in price action
 8. VOLUME PROFILE — POC/VAH/VAL as targets and support/resistance
 9. DYNAMIC ATR EXITS — volatility-scaled TP/SL, not fixed percentages
@@ -21,20 +21,22 @@ Architecture:
 18. ATR EXPANSION FILTER — only trade during active vol (avoid fee-eating chop)
 19. PROGRESSIVE STOP TIGHTENING — gradually tighten SL in second half of hold
 20. PAIR WHITELIST — restrict to backtest-validated profitable pairs
+21. BIDIRECTIONAL TRADING — both long (buy) and short (sell) signals
+
+v3.4 changes:
+- Funding rate fallback chain: Binance -> dYdX -> OKX (fixes geo-blocking on US servers)
+- Confirmed short signals already working: 112 of 166 trades (67%) are shorts
+- Backtest: LONG 54t 50% WR $+0.05 | SHORT 112t 65% WR $+7.23 (shorts carry the edge)
 
 v3.3 changes (backtest-validated, 166 trades, 90 days, 6 pairs):
 - Raised confluence to 7 (higher selectivity: 59.6% WR vs 52% at score=6)
 - Added progressive stop tightening (50%/0.3x): tighten SL from 3.5x to 1.05x ATR
   over second half of hold. Converts losing time_exits into earlier SL exits.
-  Time exit PnL: -$0.38 (was -$4.24 at v3.2)
 - Added pair whitelist: only trade ATOM/LINK/DOGE/ETH/ADA/BTC (top 6 from backtest)
-  Dropping DOT/AVAX/UNI/SUI/XRP/SOL saved $5.54/90d in losses
 - Results @ Binance 0.1%: PF=1.77, +$7.60/90d (+15.2% ROI), DD=2.3%
-- Results @ Kraken 0.2%: PF=1.26, +$2.44/90d
-- Results @ CB Advanced 0.25%: PF=1.00 (break-even)
 - Results @ CB Standard 0.6%: PF=0.52 (not profitable — need sub-0.25% fees)
 
-Paper trades by default. Uses real market data from Coinbase + Binance.
+Paper trades by default. Uses real market data from Coinbase + dYdX/OKX.
 """
 
 import argparse
@@ -153,6 +155,10 @@ COINBASE_EXCHANGE_API = "https://api.exchange.coinbase.com"
 
 # Binance Futures API (free, no auth for public endpoints)
 BINANCE_FAPI = "https://fapi.binance.com"
+# Fallback funding rate APIs (when Binance is geo-blocked, returns 451)
+BYBIT_API = "https://api.bybit.com"
+DYDX_API = "https://indexer.dydx.trade"
+OKX_API = "https://www.okx.com"
 
 GRANULARITY_SECONDS = {
     "ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900,
@@ -764,44 +770,116 @@ class CoinbaseDataClient:
 
 
 class BinanceDataClient:
-    """Fetches funding rate and open interest from Binance Futures (free, no auth)."""
+    """Fetches funding rate and open interest from Binance/Bybit Futures (free, no auth)."""
 
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
         self._funding_cache = {}
         self._oi_cache = {}
+        self._binance_blocked = False  # Track if Binance returns 451
 
-    def get_funding_rate(self, pair: str) -> Optional[dict]:
-        """Get current funding rate for a pair."""
-        symbol = _to_binance_symbol(pair)
-        cached = self._funding_cache.get(symbol)
-        if cached and time.time() - cached["time"] < 60:  # 1-min cache
-            return cached["data"]
-
+    def _get_funding_dydx(self, pair: str) -> Optional[dict]:
+        """Fallback: get funding rate from dYdX v4 (decentralized, no geo-blocking)."""
         try:
+            # dYdX uses BTC-USD format (same as Coinbase)
+            base = pair.replace("-USD", "").replace("-USDT", "")
+            dydx_symbol = f"{base}-USD"
             resp = self.session.get(
-                f"{BINANCE_FAPI}/fapi/v1/fundingRate",
-                params={"symbol": symbol, "limit": 3},
+                f"{DYDX_API}/v4/perpetualMarkets",
                 timeout=8,
             )
             if resp.status_code != 200:
                 return None
             data = resp.json()
-            if not data:
+            market = data.get("markets", {}).get(dydx_symbol)
+            if not market:
                 return None
 
-            current = data[-1]
+            rate = float(market.get("nextFundingRate", 0))
             result = {
-                "rate": float(current.get("fundingRate", 0)),
-                "time": int(current.get("fundingTime", 0)),
-                "rates_history": [float(d.get("fundingRate", 0)) for d in data],
+                "rate": rate,
+                "time": int(time.time() * 1000),
+                "rates_history": [rate],  # dYdX only gives next rate
             }
-            self._funding_cache[symbol] = {"data": result, "time": time.time()}
             return result
         except Exception as e:
-            logger.warning(f"Funding rate error {pair}: {e}")
+            logger.debug(f"dYdX funding rate error {pair}: {e}")
             return None
+
+    def _get_funding_okx(self, pair: str) -> Optional[dict]:
+        """Fallback: get funding rate from OKX (usually not geo-blocked for read)."""
+        try:
+            base = pair.replace("-USD", "").replace("-USDT", "")
+            okx_symbol = f"{base}-USDT-SWAP"
+            resp = self.session.get(
+                f"{OKX_API}/api/v5/public/funding-rate",
+                params={"instId": okx_symbol},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            rows = data.get("data", [])
+            if not rows:
+                return None
+
+            current = rows[0]
+            rate = float(current.get("fundingRate", 0))
+            result = {
+                "rate": rate,
+                "time": int(current.get("fundingTime", 0)),
+                "rates_history": [rate],
+            }
+            return result
+        except Exception as e:
+            logger.debug(f"OKX funding rate error {pair}: {e}")
+            return None
+
+    def get_funding_rate(self, pair: str) -> Optional[dict]:
+        """Get funding rate with fallback chain: Binance -> dYdX -> OKX."""
+        symbol = _to_binance_symbol(pair)
+        cached = self._funding_cache.get(symbol)
+        if cached and time.time() - cached["time"] < 60:  # 1-min cache
+            return cached["data"]
+
+        result = None
+
+        # Try Binance first (unless previously blocked)
+        if not self._binance_blocked:
+            try:
+                resp = self.session.get(
+                    f"{BINANCE_FAPI}/fapi/v1/fundingRate",
+                    params={"symbol": symbol, "limit": 3},
+                    timeout=8,
+                )
+                if resp.status_code in (451, 403):
+                    logger.info(f"Binance geo-blocked ({resp.status_code}), switching to dYdX/OKX for funding rates")
+                    self._binance_blocked = True
+                elif resp.status_code == 200:
+                    data = resp.json()
+                    if data:
+                        current = data[-1]
+                        result = {
+                            "rate": float(current.get("fundingRate", 0)),
+                            "time": int(current.get("fundingTime", 0)),
+                            "rates_history": [float(d.get("fundingRate", 0)) for d in data],
+                        }
+            except Exception as e:
+                logger.debug(f"Binance funding rate error {pair}: {e}")
+
+        # Fallback to dYdX (decentralized, most reliable)
+        if result is None:
+            result = self._get_funding_dydx(pair)
+
+        # Fallback to OKX
+        if result is None:
+            result = self._get_funding_okx(pair)
+
+        if result:
+            self._funding_cache[symbol] = {"data": result, "time": time.time()}
+            return result
+        return None
 
     def get_open_interest(self, pair: str) -> Optional[dict]:
         """Get open interest for a pair."""
@@ -2593,7 +2671,7 @@ class CryptoScalper:
         pair_mode = "dynamic" if self.pair_scanner else "static"
         lines = [
             f"{'=' * 65}",
-            f"  CRYPTO SCALPER v3.1 ({pair_mode}: {len(self.config['pairs'])} pairs)",
+            f"  CRYPTO SCALPER v3.4 ({pair_mode}: {len(self.config['pairs'])} pairs)",
             f"{'=' * 65}",
             f"  Bankroll:   ${s.bankroll:.2f} (started ${s.starting_bankroll:.2f})",
             f"  Total PnL:  ${s.total_pnl:+.2f} ({roi:+.1f}% ROI)",
@@ -2709,7 +2787,7 @@ def main():
         for f in [STATE_FILE, TRADE_LOG]:
             if os.path.exists(f):
                 os.remove(f)
-        print("Scalper v3.1 reset.")
+        print("Scalper v3.4 reset.")
         return
 
     scalper = CryptoScalper(SCALPER_CONFIG)
