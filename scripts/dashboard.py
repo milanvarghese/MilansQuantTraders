@@ -269,6 +269,34 @@ TEMPLATE = """<!DOCTYPE html>
 <div id="tab-crypto" class="tab-content active">
 <div class="container">
 
+<!-- Scalper Model Card -->
+<div class="model-card">
+  <div>
+    <div class="mc-label">Engine</div>
+    <div class="mc-val">9-Signal Confluence</div>
+  </div>
+  <div>
+    <div class="mc-label">Min Score</div>
+    <div class="mc-val">{{ crypto_config.min_confluence }}</div>
+  </div>
+  <div>
+    <div class="mc-label">Min Grade</div>
+    <div class="mc-val">{{ crypto_config.min_grade }}</div>
+  </div>
+  <div>
+    <div class="mc-label">Avg Score</div>
+    <div class="mc-val b">{{ "%.1f"|format(crypto_avg_score) }}</div>
+  </div>
+  <div>
+    <div class="mc-label">WR by Grade</div>
+    <div class="mc-val">{% for g, s in crypto_grade_wr.items() %}<span class="{{ 'g' if s >= 50 else 'r' }}">{{g}}:{{s|int}}%</span> {% endfor %}</div>
+  </div>
+  <div>
+    <div class="mc-label">Best Regime</div>
+    <div class="mc-val g">{{ crypto_best_regime }}</div>
+  </div>
+</div>
+
 <div class="stats">
   <div class="stat">
     <div class="label">Bankroll</div>
@@ -351,6 +379,20 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="chart-wrap"><canvas id="cryptoDailyChart"></canvas></div>
   </div>
 </div>
+<div class="charts" style="grid-template-columns: 1fr 1fr 1fr;">
+  <div class="chart-card">
+    <h3>Win Rate by Grade</h3>
+    <div class="chart-wrap"><canvas id="cryptoGradeChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>P&L by Regime</h3>
+    <div class="chart-wrap"><canvas id="cryptoRegimeChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Confluence Score Distribution</h3>
+    <div class="chart-wrap"><canvas id="cryptoScoreChart"></canvas></div>
+  </div>
+</div>
 
 <!-- Crypto Price Charts -->
 <div class="section">
@@ -386,7 +428,7 @@ TEMPLATE = """<!DOCTYPE html>
 <div class="section">
   <h2>Open Positions ({{ crypto_positions|length }})</h2>
   <table>
-    <tr><th>ID</th><th>Pair</th><th>Entry</th><th>Current</th><th>Change</th><th>P&L</th><th>Size</th><th>Signal</th><th>TP</th><th>SL</th><th>Opened</th></tr>
+    <tr><th>ID</th><th>Pair</th><th>Entry</th><th>Current</th><th>%</th><th>P&L</th><th>Size</th><th>Score</th><th>Grade</th><th>Regime</th><th>Signal</th><th>TP</th><th>SL</th><th>Opened</th></tr>
     {% for p in crypto_positions %}
     {% set pct = ((p.current_price - p.entry_price) / p.entry_price * 100) if p.entry_price > 0 else 0 %}
     <tr>
@@ -397,6 +439,9 @@ TEMPLATE = """<!DOCTYPE html>
       <td class="{{ 'g' if pct >= 0 else 'r' }}">{{ "%+.2f"|format(pct) }}%</td>
       <td class="{{ 'g' if p.get('unrealized_pnl', 0) >= 0 else 'r' }}">${{ "%+.4f"|format(p.get('unrealized_pnl', 0)) }}</td>
       <td>${{ "%.2f"|format(p.cost_usd) }}</td>
+      <td class="b">{{ p.get('confluence_score', '?') }}</td>
+      <td><span class="badge badge-{{ 'high' if p.get('quality_grade','') in ('A','B') else 'medium' if p.get('quality_grade','')=='C' else 'low' }}">{{ p.get('quality_grade', '?') }}</span></td>
+      <td>{{ p.get('regime', '?') }}</td>
       <td><span class="badge badge-crypto">{{ p.signal_type }}</span></td>
       <td class="g">{{ fmt_price(p.take_profit) }}</td>
       <td class="r">{{ fmt_price(p.stop_loss) }}</td>
@@ -412,7 +457,7 @@ TEMPLATE = """<!DOCTYPE html>
 <div class="section">
   <h2>Closed Trades (Last 50 of {{ crypto_closed|length }})</h2>
   <table>
-    <tr><th>ID</th><th>Pair</th><th>Entry</th><th>Exit</th><th>P&L</th><th>%</th><th>Fees</th><th>Signal</th><th>Reason</th><th>Closed</th></tr>
+    <tr><th>ID</th><th>Pair</th><th>Entry</th><th>Exit</th><th>P&L</th><th>%</th><th>Score</th><th>Grade</th><th>Regime</th><th>Signal</th><th>Reason</th><th>Closed</th></tr>
     {% for t in crypto_closed[-50:]|reverse %}
     <tr>
       <td>{{ t.id }}</td>
@@ -421,7 +466,9 @@ TEMPLATE = """<!DOCTYPE html>
       <td>{{ fmt_price(t.exit_price) }}</td>
       <td class="{{ 'g' if t.pnl >= 0 else 'r' }}">${{ "%+.4f"|format(t.pnl) }}</td>
       <td class="{{ 'g' if t.get('pnl_pct', 0) >= 0 else 'r' }}">{{ "%+.1f"|format(t.get('pnl_pct', 0)) }}%</td>
-      <td class="n">${{ "%.4f"|format(t.get('fees', 0)) }}</td>
+      <td class="b">{{ t.get('confluence_score', '?') }}</td>
+      <td><span class="badge badge-{{ 'high' if t.get('quality_grade','') in ('A','B') else 'medium' if t.get('quality_grade','')=='C' else 'low' }}">{{ t.get('quality_grade', '?') }}</span></td>
+      <td>{{ t.get('regime', '?') }}</td>
       <td><span class="badge badge-crypto">{{ t.signal_type }}</span></td>
       <td>{{ t.reason }}</td>
       <td>{{ t.get('closed_at', '')[:16] }}</td>
@@ -699,6 +746,70 @@ if (cryptoDaily.length > 0) {
       scales: {
         x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 9 } } },
         y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
+      }
+    }
+  });
+}
+
+// Crypto grade win rate chart
+const cryptoGradeWr = {{ crypto_grade_wr_full | tojson | replace("</", "<\\/") }};
+if (Object.keys(cryptoGradeWr).length > 0) {
+  const gradeLabels = Object.keys(cryptoGradeWr);
+  new Chart(document.getElementById('cryptoGradeChart'), {
+    type: 'bar',
+    data: {
+      labels: gradeLabels,
+      datasets: [
+        { label: 'Win Rate %', data: gradeLabels.map(g => cryptoGradeWr[g].wr), backgroundColor: gradeLabels.map(g => cryptoGradeWr[g].wr >= 50 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)'), borderWidth: 0 },
+      ]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e' } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => v + '%' }, max: 100 }
+      },
+      plugins: { legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ctx.parsed.y.toFixed(0) + '% (' + gradeLabels.map(g => cryptoGradeWr[g].n)[ctx.dataIndex] + ' trades)' } }
+      }
+    }
+  });
+}
+
+// Crypto P&L by regime chart
+const cryptoRegimePnl = {{ crypto_regime_pnl | tojson | replace("</", "<\\/") }};
+if (Object.keys(cryptoRegimePnl).length > 0) {
+  const regLabels = Object.keys(cryptoRegimePnl);
+  new Chart(document.getElementById('cryptoRegimeChart'), {
+    type: 'bar',
+    data: {
+      labels: regLabels,
+      datasets: [{ data: Object.values(cryptoRegimePnl), backgroundColor: regLabels.map(r => cryptoRegimePnl[r] >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)'), borderWidth: 0 }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 9 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
+      }
+    }
+  });
+}
+
+// Crypto confluence score distribution
+const cryptoScores = {{ crypto_score_data | tojson | replace("</", "<\\/") }};
+if (cryptoScores.length > 0) {
+  const scoreBins = {};
+  cryptoScores.forEach(s => { scoreBins[s] = (scoreBins[s] || 0) + 1; });
+  const sLabels = Object.keys(scoreBins).sort((a,b) => a-b);
+  new Chart(document.getElementById('cryptoScoreChart'), {
+    type: 'bar',
+    data: {
+      labels: sLabels.map(s => s + '/10'),
+      datasets: [{ data: sLabels.map(s => scoreBins[s]), backgroundColor: 'rgba(88,166,255,0.6)', borderColor: '#58a6ff', borderWidth: 1 }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e' } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', stepSize: 1 } }
       }
     }
   });
@@ -1087,6 +1198,44 @@ def index():
         sig = t.get("signal_type", "unknown")
         crypto_signal_counts[sig] += 1
 
+    # Crypto scalper model metrics
+    crypto_config = {
+        "min_confluence": 3,
+        "min_grade": "C",
+    }
+
+    # Win rate by quality grade
+    grade_stats = defaultdict(lambda: {"wins": 0, "total": 0})
+    for t in crypto_closed:
+        grade = t.get("quality_grade", "?")
+        grade_stats[grade]["total"] += 1
+        if float(t.get("pnl", 0)) > 0:
+            grade_stats[grade]["wins"] += 1
+    crypto_grade_wr = {}
+    crypto_grade_wr_full = {}
+    for g in sorted(grade_stats.keys()):
+        s = grade_stats[g]
+        wr = (s["wins"] / s["total"] * 100) if s["total"] > 0 else 0
+        crypto_grade_wr[g] = round(wr, 0)
+        crypto_grade_wr_full[g] = {"wr": round(wr, 1), "n": s["total"]}
+
+    # P&L by regime
+    regime_pnl = defaultdict(float)
+    for t in crypto_closed:
+        regime = t.get("regime", "unknown")
+        regime_pnl[regime] += float(t.get("pnl", 0))
+    crypto_regime_pnl = {k: round(v, 4) for k, v in regime_pnl.items()}
+
+    # Best regime
+    crypto_best_regime = max(crypto_regime_pnl, key=crypto_regime_pnl.get) if crypto_regime_pnl else "N/A"
+
+    # Avg confluence score
+    scores = [int(t.get("confluence_score", 0)) for t in crypto_closed if t.get("confluence_score")]
+    crypto_avg_score = sum(scores) / len(scores) if scores else 0
+
+    # Score distribution data
+    crypto_score_data = scores
+
     # Category counts for polymarket
     poly_cat_counts = defaultdict(int)
     for t in poly_closed:
@@ -1148,6 +1297,13 @@ def index():
         crypto_avg=crypto_avg,
         crypto_pnl_timeline=crypto_pnl_timeline,
         crypto_signal_counts=dict(crypto_signal_counts),
+        crypto_config=crypto_config,
+        crypto_grade_wr=crypto_grade_wr,
+        crypto_grade_wr_full=crypto_grade_wr_full,
+        crypto_regime_pnl=crypto_regime_pnl,
+        crypto_best_regime=crypto_best_regime,
+        crypto_avg_score=crypto_avg_score,
+        crypto_score_data=crypto_score_data,
         crypto_logs=crypto_logs,
         crypto_analytics=crypto_analytics,
         crypto_daily=crypto_daily,
