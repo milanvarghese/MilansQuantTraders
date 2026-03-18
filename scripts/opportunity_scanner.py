@@ -957,20 +957,159 @@ class MarketAnalyzer:
 
         return None
 
+    def scan_dutch_book(self) -> list[Opportunity]:
+        """Dutch-book scanner: find multi-outcome events where all YES prices sum < $1.00 - fees.
+
+        Fetches events (not individual markets) from the GAMMA API.
+        For truly mutually exclusive outcomes (election winners, sentencing ranges, etc.),
+        buying all outcomes guarantees profit if total cost + worst-case fee < $1.00.
+
+        Fee model: Polymarket charges 2% on net winnings per winning leg only.
+        Worst case fee = 0.02 * (1.0 - cheapest_outcome_price).
+        """
+        opportunities = []
+        try:
+            offset = 0
+            all_events = []
+            while offset < 2000:
+                resp = self.session.get(
+                    f"{GAMMA_API_URL}/events",
+                    params={"active": "true", "closed": "false", "limit": 50, "offset": offset},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                if not batch:
+                    break
+                all_events.extend(batch)
+                offset += 50
+                if len(batch) < 50:
+                    break
+                time.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Failed to fetch events for Dutch-book scan: {e}")
+            return []
+
+        for event in all_events:
+            markets = event.get("markets", [])
+            if len(markets) < 3:
+                continue  # Need 3+ outcomes for multi-outcome Dutch-book
+
+            title = event.get("title", "")
+
+            # Skip cumulative/threshold events — NOT mutually exclusive
+            # "by ___?" = cumulative dates, "above ___" = cumulative thresholds
+            title_lower = title.lower()
+            if re.search(r'\bby\b.*\?', title, re.IGNORECASE):
+                continue
+            if any(kw in title_lower for kw in ["above", "below", "before", "when will", "hit $"]):
+                continue
+
+            # Collect YES prices for each market in the event
+            legs = []
+            total_cost = 0
+            min_price = 1.0
+            max_price = 0.0
+            min_liquidity = float('inf')
+            total_volume = 0
+            has_valid_prices = True
+
+            for m in markets:
+                prices = json.loads(m.get("outcomePrices", "[]")) if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [])
+                if not prices or len(prices) < 1:
+                    has_valid_prices = False
+                    break
+
+                yes_price = float(prices[0])
+                if yes_price <= 0:
+                    continue  # Skip zero-priced outcomes (already resolved)
+
+                liq = float(m.get("liquidity", 0))
+                vol = float(m.get("volume", 0))
+
+                legs.append({
+                    "question": m.get("groupItemTitle", m.get("question", "?"))[:60],
+                    "yes_price": yes_price,
+                    "market_id": m.get("conditionId", ""),
+                    "liquidity": liq,
+                })
+                total_cost += yes_price
+                min_price = min(min_price, yes_price)
+                max_price = max(max_price, yes_price)
+                min_liquidity = min(min_liquidity, liq)
+                total_volume += vol
+
+            if not has_valid_prices or len(legs) < 3:
+                continue
+
+            # Skip if any leg has <$50 liquidity (can't execute)
+            if min_liquidity < 50:
+                continue
+
+            # Sanity check: truly mutually exclusive events should sum near 1.0
+            # If sum is < 0.70, it's likely cumulative/threshold (not mutually exclusive)
+            if total_cost < 0.70:
+                continue
+
+            # Fee calculation: worst case = cheapest outcome wins (highest fee)
+            fee_rate = CONFIG.get("fee_rate", 0.02)
+            worst_fee = fee_rate * (1.0 - min_price)
+            best_fee = fee_rate * (1.0 - max_price)
+
+            # Profit = $1.00 - total_cost - fee
+            worst_profit = 1.0 - total_cost - worst_fee
+            best_profit = 1.0 - total_cost - best_fee
+
+            # Only flag if profitable even in worst case
+            if worst_profit > 0.005:  # >0.5% minimum profit after fees
+                leg_summary = " + ".join(f"{l['question'][:25]}={l['yes_price']:.3f}" for l in legs[:5])
+                if len(legs) > 5:
+                    leg_summary += f" +{len(legs)-5} more"
+
+                opportunities.append(Opportunity(
+                    category="dutch_book",
+                    market_question=f"[DUTCH-BOOK] {title}",
+                    market_id=legs[0]["market_id"],  # First leg for reference
+                    token_id="",  # Multi-leg, no single token
+                    side="ALL",
+                    market_price=round(total_cost, 4),
+                    estimated_prob=0.999,  # Guaranteed profit
+                    edge=round(worst_profit, 4),
+                    confidence="high",
+                    reasoning=(f"Dutch-book: {len(legs)} outcomes sum to {total_cost:.4f}, "
+                              f"profit {worst_profit:.2%}-{best_profit:.2%} after 2% fee. "
+                              f"Legs: {leg_summary}"),
+                    volume=total_volume,
+                    liquidity=min_liquidity,
+                    end_date=markets[0].get("endDate", "")[:10] if markets else "",
+                    kelly_size=CONFIG["max_position_usd"],  # Max size for riskless
+                ))
+
+        logger.info(f"Dutch-book scan: checked {len(all_events)} events, "
+                    f"found {len(opportunities)} arbitrage opportunities")
+        return opportunities
+
     def scan_all(self) -> list[Opportunity]:
         """Scan all active markets and return ranked opportunities.
 
-        Now includes:
-        - All categories (crypto, event, politics, near-expiry, arbitrage)
-        - Full market pagination (not capped at 1000)
-        - Near-expiry harvesting (fastest compounding strategy)
-        - Intra-market arbitrage (riskless profit)
+        Includes:
+        - Dutch-book arbitrage (multi-outcome events, guaranteed profit)
+        - Intra-market arbitrage (YES+NO < $0.97)
+        - Near-expiry harvesting (fastest compounding, <48h priority)
+        - Crypto, event, politics analysis
+        - Near-resolution prioritization (markets closing <48h ranked higher)
         """
         markets = self.fetch_all_active_markets()
         opportunities = []
 
         # Pre-fetch crypto prices
         self.crypto.get_prices()
+
+        # Dutch-book scan (multi-outcome events)
+        dutch_opps = self.scan_dutch_book()
+        opportunities.extend(dutch_opps)
+
+        now = datetime.now(timezone.utc)
 
         for market in markets:
             try:
@@ -981,7 +1120,7 @@ class MarketAnalyzer:
                         # Use end-of-day (23:59:59) so we don't skip markets on their closing date
                         end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
                             hour=23, minute=59, second=59, tzinfo=timezone.utc)
-                        if end_dt < datetime.now(timezone.utc):
+                        if end_dt < now:
                             continue
                     except ValueError:
                         pass
@@ -994,6 +1133,15 @@ class MarketAnalyzer:
                 # Check near-expiry harvesting (fast compounding)
                 near_opp = self.analyze_near_expiry(market)
                 if near_opp:
+                    # Add urgency tag for markets closing very soon
+                    try:
+                        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        hours_left = (end_dt - now).total_seconds() / 3600
+                        if hours_left < 24:
+                            near_opp.reasoning = f"[URGENT <24h] {near_opp.reasoning}"
+                            near_opp.confidence = "high"
+                    except (ValueError, TypeError):
+                        pass
                     opportunities.append(near_opp)
 
                 # Category-specific analysis
@@ -1007,25 +1155,45 @@ class MarketAnalyzer:
                 # Weather handled by weather_scanner.py
 
                 if opp and opp.edge > CONFIG["entry_threshold"]:
+                    # Boost near-resolution markets
+                    try:
+                        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        hours_left = (end_dt - now).total_seconds() / 3600
+                        if hours_left < 48:
+                            opp.reasoning = f"[CLOSING <48h] {opp.reasoning}"
+                            if opp.confidence == "medium":
+                                opp.confidence = "high"  # Upgrade confidence for near-resolution
+                    except (ValueError, TypeError):
+                        pass
                     opportunities.append(opp)
 
             except Exception as e:
                 logger.debug(f"Error analyzing market: {e}")
                 continue
 
-        # Sort: arbitrage first (riskless), then by edge * confidence
+        # Sort: dutch_book/arbitrage first (riskless), then near-resolution, then by edge * confidence
         confidence_weight = {"high": 3, "medium": 2, "low": 1}
 
         def sort_key(o):
-            if o.category == "arbitrage":
-                return (1, o.edge)  # Arbitrage always first
-            return (0, o.edge * confidence_weight.get(o.confidence, 1))
+            if o.category in ("dutch_book", "arbitrage"):
+                return (3, o.edge)  # Riskless always first
+            # Near-resolution bonus: markets closing <48h get priority
+            near_bonus = 0
+            if "[URGENT" in o.reasoning or "[CLOSING" in o.reasoning:
+                near_bonus = 1
+            if o.category == "near_expiry":
+                return (2 + near_bonus, o.edge * confidence_weight.get(o.confidence, 1))
+            return (0 + near_bonus, o.edge * confidence_weight.get(o.confidence, 1))
 
         opportunities.sort(key=sort_key, reverse=True)
 
+        n_dutch = sum(1 for o in opportunities if o.category == 'dutch_book')
+        n_arb = sum(1 for o in opportunities if o.category == 'arbitrage')
+        n_near = sum(1 for o in opportunities if o.category == 'near_expiry')
+        n_urgent = sum(1 for o in opportunities if '[URGENT' in o.reasoning or '[CLOSING' in o.reasoning)
+
         logger.info(f"Found {len(opportunities)} opportunities across {len(markets)} markets "
-                    f"(arb: {sum(1 for o in opportunities if o.category == 'arbitrage')}, "
-                    f"near_expiry: {sum(1 for o in opportunities if o.category == 'near_expiry')})")
+                    f"(dutch_book: {n_dutch}, arb: {n_arb}, near_expiry: {n_near}, urgent<48h: {n_urgent})")
         return opportunities
 
 
