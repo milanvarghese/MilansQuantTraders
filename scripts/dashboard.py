@@ -198,6 +198,13 @@ TEMPLATE = """<!DOCTYPE html>
   .badge-paper { background: #1c1d5e; color: #a5b4fc; border: 1px solid #6366f1; }
   .badge-live { background: #0d2818; color: #3fb950; border: 1px solid #238636; }
   .badge-crypto { background: #2d1f0e; color: #d29922; border: 1px solid #9e6a03; }
+  .badge-high { background: #0d2818; color: #3fb950; border: 1px solid #238636; }
+  .badge-medium { background: #2d1f0e; color: #d29922; border: 1px solid #9e6a03; }
+  .badge-low { background: #2d1117; color: #f85149; border: 1px solid #da3633; }
+
+  .model-card { background: linear-gradient(135deg, #0d1f2d, #161b22); border: 1px solid #1f6feb33; border-radius: 8px; padding: 14px 20px; margin-bottom: 20px; display: flex; gap: 30px; align-items: center; flex-wrap: wrap; }
+  .model-card .mc-label { font-size: 0.6em; text-transform: uppercase; letter-spacing: 1.5px; color: #58a6ff; }
+  .model-card .mc-val { font-size: 1.1em; font-weight: 700; color: #c9d1d9; }
 
   .log-box { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 10px 12px; font-size: 0.65em; max-height: 220px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.7; font-family: 'JetBrains Mono', 'Fira Code', monospace; color: #8b949e; }
   .empty { color: #484f58; font-style: italic; padding: 20px; text-align: center; }
@@ -437,6 +444,34 @@ TEMPLATE = """<!DOCTYPE html>
 <div id="tab-poly" class="tab-content">
 <div class="container">
 
+<!-- Model Info Card -->
+<div class="model-card">
+  <div>
+    <div class="mc-label">Model</div>
+    <div class="mc-val">GBM + Momentum</div>
+  </div>
+  <div>
+    <div class="mc-label">Brier Score</div>
+    <div class="mc-val g">0.1506</div>
+  </div>
+  <div>
+    <div class="mc-label">Backtest Accuracy</div>
+    <div class="mc-val">77.9%</div>
+  </div>
+  <div>
+    <div class="mc-label">Markets Tested</div>
+    <div class="mc-val">9,838</div>
+  </div>
+  <div>
+    <div class="mc-label">Vol Multiplier</div>
+    <div class="mc-val">1.6x</div>
+  </div>
+  <div>
+    <div class="mc-label">Avg Edge (Trades)</div>
+    <div class="mc-val b">{{ "%.1f"|format(poly_avg_edge * 100) }}%</div>
+  </div>
+</div>
+
 <div class="stats">
   <div class="stat">
     <div class="label">Bankroll</div>
@@ -510,12 +545,26 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="chart-wrap"><canvas id="polyPnlChart"></canvas></div>
   </div>
   <div class="chart-card">
-    <h3>Trades by Category</h3>
-    <div class="chart-wrap"><canvas id="polyCatChart"></canvas></div>
+    <h3>Edge Distribution</h3>
+    <div class="chart-wrap"><canvas id="polyEdgeChart"></canvas></div>
   </div>
   <div class="chart-card">
     <h3>Daily P&L</h3>
     <div class="chart-wrap"><canvas id="polyDailyChart"></canvas></div>
+  </div>
+</div>
+<div class="charts" style="grid-template-columns: 1fr 1fr 1fr;">
+  <div class="chart-card">
+    <h3>Trades by Category</h3>
+    <div class="chart-wrap"><canvas id="polyCatChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Confidence Breakdown</h3>
+    <div class="chart-wrap"><canvas id="polyConfChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>P&L by Confidence</h3>
+    <div class="chart-wrap"><canvas id="polyConfPnlChart"></canvas></div>
   </div>
 </div>
 
@@ -524,18 +573,20 @@ TEMPLATE = """<!DOCTYPE html>
 <div class="section">
   <h2>Open Positions ({{ poly_positions|length }})</h2>
   <table>
-    <tr><th>ID</th><th>Side</th><th>Market</th><th>Category</th><th>Entry</th><th>Current</th><th>Cost</th><th>P&L</th><th>Edge</th><th>Opened</th></tr>
+    <tr><th>ID</th><th>Side</th><th>Market</th><th>Cat</th><th>Entry</th><th>Model</th><th>Current</th><th>Cost</th><th>P&L</th><th>Edge</th><th>Conf</th><th>Opened</th></tr>
     {% for p in poly_positions %}
     <tr>
       <td>{{ p.id }}</td>
       <td><span class="{{ 'g' if p.side == 'YES' else 'r' }}">{{ p.side }}</span></td>
-      <td>{{ p.market_question[:55] }}</td>
+      <td title="{{ p.market_question }}">{{ p.market_question[:50] }}</td>
       <td>{{ p.category }}</td>
       <td>{{ "%.1f"|format(p.entry_price * 100) }}c</td>
+      <td class="b">{{ "%.0f"|format(p.get('estimated_prob', 0) * 100) }}%</td>
       <td>{{ "%.1f"|format(p.get('current_price', p.entry_price) * 100) }}c</td>
       <td>${{ "%.2f"|format(p.cost_usd) }}</td>
       <td class="{{ 'g' if p.get('unrealized_pnl', 0) >= 0 else 'r' }}">${{ "%+.2f"|format(p.get('unrealized_pnl', 0)) }}</td>
       <td class="g">{{ "%.1f"|format(p.edge_at_entry * 100) }}%</td>
+      <td><span class="badge badge-{{ p.get('confidence', 'low') }}">{{ p.get('confidence', '?') }}</span></td>
       <td>{{ p.opened_at[:16] }}</td>
     </tr>
     {% endfor %}
@@ -548,17 +599,20 @@ TEMPLATE = """<!DOCTYPE html>
 <div class="section">
   <h2>Closed Trades (Last 50 of {{ poly_closed|length }})</h2>
   <table>
-    <tr><th>ID</th><th>Side</th><th>Market</th><th>Category</th><th>Entry</th><th>Exit</th><th>P&L</th><th>CLV</th><th>Reason</th><th>Closed</th></tr>
+    <tr><th>ID</th><th>Side</th><th>Market</th><th>Cat</th><th>Entry</th><th>Model</th><th>Exit</th><th>P&L</th><th>Edge</th><th>CLV</th><th>Conf</th><th>Reason</th><th>Closed</th></tr>
     {% for t in poly_closed[-50:]|reverse %}
     <tr>
       <td>{{ t.id }}</td>
       <td><span class="{{ 'g' if t.side == 'YES' else 'r' }}">{{ t.side }}</span></td>
-      <td>{{ t.market_question[:55] }}</td>
+      <td title="{{ t.market_question }}">{{ t.market_question[:45] }}</td>
       <td>{{ t.category }}</td>
       <td>{{ "%.1f"|format(t.entry_price * 100) }}c</td>
+      <td class="b">{{ "%.0f"|format(t.get('estimated_prob', 0) * 100) }}%</td>
       <td>{{ "%.1f"|format(t.exit_price * 100) }}c</td>
       <td class="{{ 'g' if t.pnl >= 0 else 'r' }}">${{ "%+.2f"|format(t.pnl) }}</td>
+      <td class="g">{{ "%.1f"|format(t.get('edge_at_entry', 0) * 100) }}%</td>
       <td class="{{ 'g' if t.get('clv', 0) >= 0 else 'r' }}">{{ "%+.1f"|format(t.get('clv', 0) * 100) }}c</td>
+      <td><span class="badge badge-{{ t.get('confidence', 'low') }}">{{ t.get('confidence', '?') }}</span></td>
       <td>{{ t.reason }}</td>
       <td>{{ t.get('closed_at', '')[:16] }}</td>
     </tr>
@@ -702,6 +756,68 @@ if (polyDaily.length > 0) {
     options: { ...chartDefaults,
       scales: {
         x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 9 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
+      }
+    }
+  });
+}
+
+// Edge distribution histogram
+const polyEdges = {{ poly_edge_data | tojson | replace("</", "<\\/") }};
+if (polyEdges.length > 0) {
+  const bins = ['5-10%','10-15%','15-20%','20-30%','30%+'];
+  const counts = [0,0,0,0,0];
+  polyEdges.forEach(e => {
+    if (e < 10) counts[0]++;
+    else if (e < 15) counts[1]++;
+    else if (e < 20) counts[2]++;
+    else if (e < 30) counts[3]++;
+    else counts[4]++;
+  });
+  new Chart(document.getElementById('polyEdgeChart'), {
+    type: 'bar',
+    data: {
+      labels: bins,
+      datasets: [{ data: counts, backgroundColor: 'rgba(88,166,255,0.6)', borderColor: '#58a6ff', borderWidth: 1 }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 9 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', stepSize: 1 } }
+      }
+    }
+  });
+}
+
+// Confidence breakdown
+const polyConfs = {{ poly_conf_counts | tojson | replace("</", "<\\/") }};
+if (Object.keys(polyConfs).length > 0) {
+  const confColors = { high: '#3fb950', medium: '#d29922', low: '#f85149' };
+  const labels = Object.keys(polyConfs);
+  new Chart(document.getElementById('polyConfChart'), {
+    type: 'doughnut',
+    data: {
+      labels: labels,
+      datasets: [{ data: Object.values(polyConfs), backgroundColor: labels.map(l => confColors[l] || '#8b949e'), borderWidth: 0 }]
+    },
+    options: { ...chartDefaults, plugins: { legend: { display: true, position: 'right', labels: { color: '#8b949e', font: { size: 10 }, padding: 6 } } } }
+  });
+}
+
+// P&L by confidence
+const polyConfPnl = {{ poly_conf_pnl | tojson | replace("</", "<\\/") }};
+if (Object.keys(polyConfPnl).length > 0) {
+  const confLabels = Object.keys(polyConfPnl);
+  const confPnlColors = { high: 'rgba(63,185,80,0.7)', medium: 'rgba(210,153,34,0.7)', low: 'rgba(248,81,73,0.7)' };
+  new Chart(document.getElementById('polyConfPnlChart'), {
+    type: 'bar',
+    data: {
+      labels: confLabels,
+      datasets: [{ data: Object.values(polyConfPnl), backgroundColor: confLabels.map(l => confPnlColors[l] || 'rgba(139,148,158,0.7)'), borderWidth: 0 }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e' } },
         y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
       }
     }
@@ -977,6 +1093,35 @@ def index():
         cat = t.get("category", "unknown")
         poly_cat_counts[cat] += 1
 
+    # Edge distribution data (as percentages)
+    poly_edge_data = []
+    for t in poly_closed:
+        edge = float(t.get("edge_at_entry", 0)) * 100
+        if edge > 0:
+            poly_edge_data.append(round(edge, 1))
+    for p in poly_positions:
+        edge = float(p.get("edge_at_entry", 0)) * 100
+        if edge > 0:
+            poly_edge_data.append(round(edge, 1))
+
+    # Confidence breakdown
+    poly_conf_counts = defaultdict(int)
+    for t in poly_closed:
+        conf = t.get("confidence", "unknown")
+        poly_conf_counts[conf] += 1
+
+    # P&L by confidence
+    poly_conf_pnl = defaultdict(float)
+    for t in poly_closed:
+        conf = t.get("confidence", "unknown")
+        poly_conf_pnl[conf] += float(t.get("pnl", 0))
+    poly_conf_pnl = {k: round(v, 4) for k, v in poly_conf_pnl.items()}
+
+    # Average edge across all trades
+    all_edges = [float(t.get("edge_at_entry", 0)) for t in poly_closed] + \
+                [float(p.get("edge_at_entry", 0)) for p in poly_positions]
+    poly_avg_edge = sum(all_edges) / len(all_edges) if all_edges else 0
+
     # Logs
     crypto_logs = load_recent_logs(CRYPTO_LOG_FILE)
     poly_logs = load_recent_logs(PAPER_LOG_FILE)
@@ -1015,6 +1160,10 @@ def index():
         poly_roi=poly_roi,
         poly_pnl_timeline=poly_pnl_timeline,
         poly_cat_counts=dict(poly_cat_counts),
+        poly_edge_data=poly_edge_data,
+        poly_conf_counts=dict(poly_conf_counts),
+        poly_conf_pnl=dict(poly_conf_pnl),
+        poly_avg_edge=poly_avg_edge,
         poly_logs=poly_logs,
         poly_analytics=poly_analytics,
         poly_daily=poly_daily,
