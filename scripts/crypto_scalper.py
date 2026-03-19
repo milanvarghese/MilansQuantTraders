@@ -77,7 +77,7 @@ SCALPER_CONFIG = {
     "max_open_positions": 5,         # HFT: more concurrent positions
     "max_exposure_pct": 0.70,        # 70% of bankroll at risk (higher turnover)
     # Confluence requirements (v3.3: raised from 6 to 7 — backtest: 59.6% WR vs 52% at score=6)
-    "min_confluence_score": 7,       # Require 7+ confluence for entry (was 6, v3.2)
+    "min_confluence_score": 5,       # Require 5+ confluence for entry (7 too restrictive in low-vol bear)
     "min_signal_quality": "C",       # Accept C-grade+ signals
     "min_ranging_score": 5,          # Higher bar in ranging markets (backtest: 11% WR otherwise)
     # Pair whitelist: only trade backtest-validated profitable pairs
@@ -121,8 +121,8 @@ SCALPER_CONFIG = {
     "candle_granularity_trend": "ONE_HOUR",      # 1H for trend context
     "candle_lookback": 50,
     # Fees (Coinbase taker — worst case for paper trading)
-    "taker_fee_pct": 0.006,
-    "maker_fee_pct": 0.004,
+    "taker_fee_pct": 0.001,            # Binance taker fee (target exchange for live)
+    "maker_fee_pct": 0.001,            # Binance maker fee
     # Order book imbalance thresholds — HFT: more sensitive
     "ob_strong_buy": 0.20,           # HFT: lower threshold (was 0.25)
     "ob_strong_sell": -0.20,         # HFT: lower threshold (was -0.25)
@@ -131,7 +131,7 @@ SCALPER_CONFIG = {
     "funding_extreme_low": -0.0003,  # < -0.03% = oversold
     # --- v3.0: Profit-maximizing filters ---
     # Fear & Greed sentiment filter (alternative.me free API)
-    "fear_greed_extreme_fear": 20,   # < 20 = extreme fear -> mean reversion strongest
+    "fear_greed_extreme_fear": 25,   # < 25 = extreme fear -> mean reversion strongest
     "fear_greed_extreme_greed": 80,  # > 80 = extreme greed -> momentum/caution
     "fear_greed_no_trade_zone": 10,  # < 10 = panic, skip all entries
     # CUSUM entry filter (Lopez de Prado): only trade on meaningful moves
@@ -668,7 +668,7 @@ class CoinbaseDataClient:
     def get_candles(self, product_id: str, granularity: str = "FIVE_MINUTE",
                     num_candles: int = 50) -> Optional[list[dict]]:
         """Get OHLCV candles. Returns oldest-first."""
-        cache_key = f"{product_id}_{granularity}"
+        cache_key = f"{product_id}_{granularity}_{num_candles}"
         cached = self._candle_cache.get(cache_key)
         if cached and time.time() - cached["time"] < 15:  # HFT: 15s cache (was 25s)
             return cached["data"]
@@ -1316,6 +1316,7 @@ class SignalDetector:
                 ctx: MarketContext) -> Optional[Signal]:
         """Analyze a pair using all available data. Returns best signal or None."""
         if not candles_5m or len(candles_5m) < 35:
+            logger.debug(f"  {pair}: insufficient candles ({len(candles_5m) if candles_5m else 0}/35)")
             return None
 
         closes = [c["close"] for c in candles_5m]
@@ -1333,6 +1334,7 @@ class SignalDetector:
         fvgs = detect_fvg(candles_5m[-10:])  # Recent FVGs only
 
         if rsi is None or atr is None:
+            logger.debug(f"  {pair}: indicator calc failed (rsi={rsi}, atr={atr})")
             return None
 
         # Store ATR in context
@@ -1642,10 +1644,9 @@ class SignalDetector:
             sell_reasons.append("Price near swing resistance level")
 
         # 16. ATR expansion/contraction for sell
-        if ctx.atr_ratio < self.config.get("atr_contraction_threshold", 0.8):
-            sell_score -= 2
-            sell_components.append("ATR_CONTRACTED")
-        elif ctx.atr_ratio > self.config.get("atr_expansion_threshold", 1.3):
+        # Note: no contraction penalty for sells — in sustained bear markets,
+        # low vol doesn't invalidate the short thesis (unlike longs in chop)
+        if ctx.atr_ratio > self.config.get("atr_expansion_threshold", 1.3):
             sell_score += 1
             sell_components.append("ATR_EXPANDING")
 
@@ -1687,6 +1688,11 @@ class SignalDetector:
                 best_reasons = sell_reasons
 
         if best_side is None:
+            logger.info(
+                f"  {pair}: buy={score} sell={sell_score} "
+                f"(need {min_score}) | b:[{','.join(components[:4])}] "
+                f"s:[{','.join(sell_components[:4])}]"
+            )
             return None
 
         grade = "A" if best_score >= 7 else "B" if best_score >= 5 else "C" if best_score >= 4 else "D"
