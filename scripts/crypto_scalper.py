@@ -73,16 +73,16 @@ SCALPER_CONFIG = {
     "max_pairs": 80,                     # Cap to avoid API rate limits
     # Bankroll
     "bankroll": 50.00,
-    "max_position_usd": 6.00,       # Moderate size, high turnover
-    "max_open_positions": 5,         # HFT: more concurrent positions
-    "max_exposure_pct": 0.70,        # 70% of bankroll at risk (higher turnover)
+    "max_position_usd": 4.00,       # Smaller per-trade, spread across more pairs
+    "max_open_positions": 8,         # More concurrent positions for wider universe
+    "max_exposure_pct": 0.75,        # 75% of bankroll at risk
     # Confluence requirements (v3.3: raised from 6 to 7 — backtest: 59.6% WR vs 52% at score=6)
     "min_confluence_score": 5,       # Require 5+ confluence for entry (7 too restrictive in low-vol bear)
     "min_signal_quality": "C",       # Accept C-grade+ signals
     "min_ranging_score": 5,          # Higher bar in ranging markets (backtest: 11% WR otherwise)
     # Pair whitelist: only trade backtest-validated profitable pairs
     # Set to None/empty to trade all pairs from dynamic discovery
-    "pair_whitelist": ["BTC", "ETH", "DOGE", "ADA", "ATOM", "LINK"],
+    "pair_whitelist": ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "ATOM", "SUI", "NEAR", "INJ", "ARB", "OP", "FET", "RENDER", "SEI", "APT", "TIA", "TAO"],
     # Regime-adaptive thresholds
     "adx_trending": 25,              # ADX > 25 = trending
     "adx_ranging": 20,               # ADX < 20 = ranging

@@ -150,6 +150,16 @@ TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trading Dashboard</title>
 <meta http-equiv="refresh" content="15">
+<script>
+// Persist UI state across refreshes
+window.addEventListener('beforeunload', function() {
+  if (typeof currentPair !== 'undefined' && currentPair) localStorage.setItem('ds_pair', currentPair);
+  if (typeof currentGranularity !== 'undefined') localStorage.setItem('ds_gran', currentGranularity);
+  if (typeof currentLimit !== 'undefined') localStorage.setItem('ds_limit', currentLimit);
+  const activeTab = document.querySelector('.tab-content.active');
+  if (activeTab) localStorage.setItem('ds_tab', activeTab.id);
+});
+</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -257,10 +267,10 @@ TEMPLATE = """<!DOCTYPE html>
 
 <!-- Tabs -->
 <div class="tabs">
-  <div class="tab active" onclick="switchTab('crypto')">
+  <div class="tab active" onclick="switchTab('crypto', this)">
     Crypto Scalper <span class="badge-count">{{ crypto_positions|length }} open</span>
   </div>
-  <div class="tab" onclick="switchTab('poly')">
+  <div class="tab" onclick="switchTab('poly', this)">
     Polymarket <span class="badge-count">{{ poly_positions|length }} open</span>
   </div>
 </div>
@@ -678,12 +688,14 @@ TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
-// Tab switching
-function switchTab(tab) {
-  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+// Tab switching with persistence
+function switchTab(tab, el) {
+  document.querySelectorAll('.tab-content').forEach(e => e.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(e => e.classList.remove('active'));
   document.getElementById('tab-' + tab).classList.add('active');
-  event.target.closest('.tab').classList.add('active');
+  if (el) el.closest('.tab').classList.add('active');
+  else { document.querySelectorAll('.tab')[tab === 'crypto' ? 0 : 1].classList.add('active'); }
+  localStorage.setItem('ds_tab', 'tab-' + tab);
 }
 
 const chartDefaults = {
@@ -943,6 +955,7 @@ let currentLimit = 168;
 
 function loadChart(pair) {
   currentPair = pair;
+  localStorage.setItem('ds_pair', pair);
   document.querySelectorAll('.pair-btn').forEach(b => {
     b.style.background = '#161b22'; b.style.color = '#8b949e'; b.style.borderColor = '#21262d';
   });
@@ -962,6 +975,8 @@ function loadChart(pair) {
 function changeTimeframe(gran, limit) {
   currentGranularity = gran;
   currentLimit = limit;
+  localStorage.setItem('ds_gran', gran);
+  localStorage.setItem('ds_limit', limit);
   document.querySelectorAll('.tf-btn').forEach(b => {
     b.style.background = '#161b22'; b.style.color = '#8b949e';
   });
@@ -1047,10 +1062,33 @@ function renderPriceChart(candles, pair) {
   });
 }
 
-// Auto-load first pair
-{% if crypto_pairs %}
-loadChart('{{ crypto_pairs[0] }}');
-{% endif %}
+// Restore saved state or auto-load defaults
+{
+  const savedGran = localStorage.getItem('ds_gran');
+  const savedLimit = localStorage.getItem('ds_limit');
+  if (savedGran) { currentGranularity = savedGran; currentLimit = parseInt(savedLimit) || 168; }
+
+  const savedTab = localStorage.getItem('ds_tab');
+  if (savedTab && savedTab !== 'tab-crypto') {
+    switchTab(savedTab.replace('tab-', ''));
+  }
+
+  {% if crypto_pairs %}
+  const savedPair = localStorage.getItem('ds_pair');
+  const pairs = {{ crypto_pairs | tojson }};
+  const startPair = (savedPair && pairs.includes(savedPair)) ? savedPair : '{{ crypto_pairs[0] }}';
+  loadChart(startPair);
+
+  // Highlight saved timeframe button
+  if (savedGran) {
+    document.querySelectorAll('.tf-btn').forEach(b => {
+      b.style.background = '#161b22'; b.style.color = '#8b949e';
+      if (b.textContent.trim() === {ONE_HOUR:'1H',FIVE_MINUTE:'5M',FIFTEEN_MINUTE:'15M',SIX_HOUR:'6H',ONE_DAY:'1D'}[savedGran])
+        { b.style.background = '#0d2744'; b.style.color = '#58a6ff'; }
+    });
+  }
+  {% endif %}
+}
 </script>
 </body>
 </html>"""

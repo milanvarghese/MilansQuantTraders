@@ -515,7 +515,7 @@ class PaperTrader:
                     continue
                 if self.open_position(opp):
                     opened += 1
-                if opened >= 3:  # Max 3 new positions per scan
+                if opened >= 5:  # Max 5 new positions per scan
                     break
 
         self.state.last_scan = datetime.now(timezone.utc).isoformat()

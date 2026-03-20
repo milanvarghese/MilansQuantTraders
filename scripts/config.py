@@ -10,8 +10,8 @@ CONFIG = {
     "entry_threshold": 0.05,       # Min 5% edge to enter
     "exit_threshold": 0.45,        # Sell when bucket price > 45c
     "max_position_usd": 2.00,      # Max $2 per bucket
-    "max_open_positions": 15,      # Max 15 concurrent (laddering across buckets)
-    "max_exposure_pct": 0.40,      # Max 40% of bankroll at risk
+    "max_open_positions": 25,      # Max 25 concurrent (wider market coverage)
+    "max_exposure_pct": 0.50,      # Max 50% of bankroll at risk
     "daily_loss_limit": -5.00,     # Auto-pause if -$5 on the day
     "kelly_fraction": 0.10,        # Start 10% Kelly — increase via dynamic Kelly after CLV proven
     "scan_interval_min": 5,        # Scan every 5 min (catch forecast updates fast)
@@ -30,7 +30,7 @@ CONFIG = {
     "drawdown_critical": 0.20,     # 15-20%: reduce to 50% sizing
     "max_drawdown_pct": 0.25,      # 20-25%: reduce to 25% sizing. >25%: pause
     "max_consecutive_losses": 5,   # Pause after 5 straight losses
-    "max_daily_trades": 30,        # Max trades per day (higher for laddering)
+    "max_daily_trades": 50,        # Max trades per day (wider market coverage)
     # --- Exit Logic ---
     "exit_edge_reversal": True,    # Exit when edge reverses (current_price > estimated_prob)
     "exit_trailing_stop": 0.10,    # Trailing stop: exit if price drops 10c from peak
