@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Automated trading system with two independent bots:
+Automated trading system with three independent bots:
 1. **Crypto Scalper** (`scripts/crypto_scalper.py`) - Confluence-based crypto spot trading via Coinbase/Binance APIs
 2. **Polymarket Paper Trader** (`scripts/paper_trader.py`) - Prediction market trading with probability estimation via weather ensembles, crypto prices, and market analysis
+3. **Stock Trader** (`scripts/stock_trader.py`) - 12-signal confluence stock trading via Alpaca API (commission-free, fractional shares)
 
-Both run 24/7 on an Oracle Cloud server (129.153.155.228) with a Flask dashboard (`scripts/dashboard.py`) on port 8080.
+All run on an Oracle Cloud server (129.153.155.228) with a Flask dashboard (`scripts/dashboard.py`) on port 8080.
 
 ## Commands
 
@@ -43,6 +44,12 @@ python scripts/backtest_lab.py sweep-combined              # Test promising comb
 python scripts/backtest_lab.py custom "description" key=val  # Custom parameter test
 python scripts/backtest_lab.py report                      # Print full backtest history
 
+# Stock trader (v1.0: 12-signal confluence, Alpaca API, market-hours only)
+python scripts/stock_trader.py --interval 900             # Run with 15-min scans (default)
+python scripts/stock_trader.py --status                    # Print current state
+python scripts/stock_trader.py --reset                     # Wipe state for fresh start
+python scripts/stock_trader.py --scan-once --verbose       # Single scan with debug output
+
 # Polymarket paper trader
 python scripts/paper_trader.py --interval 5 --update-interval 1  # 5-min scans, 1-min price updates
 python scripts/paper_trader.py --status
@@ -57,6 +64,18 @@ python scripts/opportunity_scanner.py --scan-once
 ```
 
 ## Architecture
+
+### Stock Trader (`scripts/stock_trader.py` ~1700 lines)
+Self-contained trading engine using Alpaca API. Key classes:
+- `AlpacaClient` - Alpaca REST API wrapper (bars, quotes, orders, clock, calendar)
+- `RegimeDetector` - SPY/VIX-based market regime (Bull/Cautious/Bear/HighVol/Choppy) with anti-whipsaw
+- `SignalDetector` - 12-signal confluence scoring (0-12 scale): daily/weekly trend EMAs, RSI bounce, MACD cross, volume spike, relative strength vs SPY, Bollinger band, VWAP reclaim, 52-week proximity, sector momentum, earnings shield, market regime
+- `SignalBandit` - Thompson Sampling bandit auto-weights signals by recent success
+- `EarningsCalendar` - Yahoo Finance earnings date lookup, entry/exit shields
+- `StockTrader` - Main loop: market-hours only (9:30-16:00 ET), scans 110 instruments (20 mega cap + 15 growth/tech + 15 sector leaders + 10 high-beta + 10 ETFs)
+- Exits: TP=3x daily ATR, SL=1.5x ATR, trailing stop after 2x ATR, progressive tightening, 10-day max hold, earnings exit
+- Circuit breakers: daily -3% loss limit, 3 consecutive losses cooldown, -15% drawdown pause, -25% kill switch
+- Auto-tunes every 20 closed trades (sector WR, confluence threshold, bandit weights)
 
 ### Crypto Scalper (`scripts/crypto_scalper.py` ~2600 lines)
 Self-contained trading engine with no imports from other project modules. Key classes:
@@ -80,6 +99,10 @@ These modules work together:
 - `noaa_client.py` - Weather data from NOAA (US) and Open-Meteo (worldwide)
 
 ### State Files
+- `stock_trading/state.json` - Stock trader positions, bankroll, counters, regime, bandit state
+- `stock_trading/trades.csv` - Closed stock trade history
+- `stock_trading/analytics.jsonl` - Full market context per stock trade
+- `stock_trading/tuning.json` - Auto-tuner adjustments log
 - `crypto_trading/state.json` - Scalper positions, bankroll, counters
 - `crypto_trading/trades.csv` - Closed trade history
 - `crypto_trading/analytics.json` - Full market context per trade (for ML/analysis)
@@ -109,17 +132,20 @@ ssh -i ssh-key-2026-03-17.key ubuntu@129.153.155.228
 cd /home/ubuntu/polymarket-bot
 nohup venv/bin/python scripts/crypto_scalper.py --interval 30 > /dev/null 2>&1 &
 nohup venv/bin/python scripts/paper_trader.py --interval 5 --update-interval 1 > /dev/null 2>&1 &
+nohup venv/bin/python scripts/stock_trader.py --interval 900 > /dev/null 2>&1 &
 nohup venv/bin/python scripts/dashboard.py --port 8080 > /dev/null 2>&1 &
 ```
 
-## Data Sources (all free, no API keys needed)
+## Data Sources (all free or API key provided)
 
 - **Coinbase**: OHLCV candles, order book (L2), ticker prices
 - **Binance**: Perpetual funding rates (public endpoint)
 - **Open-Meteo**: Weather forecasts + ensemble data (ECMWF/GFS/ICON)
 - **NOAA**: US weather forecasts (User-Agent header required, no key)
 - **CoinGecko**: Crypto prices for Polymarket opportunity scanning
+- **The Odds API**: Bookmaker odds for sports markets (free tier: 500 req/month, key required)
 - **Polymarket GAMMA API**: Market discovery, prices, orderbook
+- **Alpaca**: Stock bars (daily/hourly/5min), quotes, account, positions, market clock (API key required)
 
 ## Environment Variables (.env)
 
@@ -128,4 +154,7 @@ Required for live trading only (paper trading works without):
 - `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE` - CLOB API credentials
 - `DASH_USER`, `DASH_PASS` - Dashboard authentication
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` - Alert notifications
+- `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` - Alpaca paper/live trading API
+- `ALPACA_BASE_URL` - Alpaca endpoint (default: `https://paper-api.alpaca.markets`)
+- `ODDS_API_KEY` - The Odds API key for sports bookmaker odds (free at the-odds-api.com)
 - `HTTP_PROXY` - Optional, for Cloudflare/geo-blocking issues

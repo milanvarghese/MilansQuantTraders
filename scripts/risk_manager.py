@@ -8,6 +8,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -46,6 +47,7 @@ class RiskState:
     is_paused: bool = False
     pause_reason: str = ""
     last_reset_date: str = ""
+    last_loss_time: float = 0.0
 
     @property
     def open_exposure(self) -> float:
@@ -126,6 +128,14 @@ class RiskManager:
         """
         if market_meta is None:
             market_meta = {}
+
+        if self.state.is_paused and "Consecutive loss" in self.state.pause_reason:
+            pause_duration = time.time() - self.state.last_loss_time
+            if pause_duration > 4 * 3600:
+                self.state.is_paused = False
+                self.state.consecutive_losses = 0
+                self.state.pause_reason = ""
+                self._save_state()
 
         # 1. Is trading paused?
         if self.state.is_paused:
@@ -241,6 +251,7 @@ class RiskManager:
             self.state.consecutive_losses = 0
         else:
             self.state.consecutive_losses += 1
+            self.state.last_loss_time = time.time()
 
         # Update peak bankroll for drawdown tracking
         if self.state.bankroll > self.state.peak_bankroll:
@@ -250,6 +261,26 @@ class RiskManager:
         self._log_trade("EXIT", {**pos, "exit_price": exit_price, "pnl": pnl})
         logger.info(f"Position closed: {pos['city']} {pos['bucket']} "
                     f"PnL=${pnl:+.2f} (total: ${self.state.total_pnl:+.2f})")
+
+    def record_trade(self, pnl: float):
+        """Record a trade result for circuit-breaker tracking."""
+        self.state.daily_pnl += pnl
+        self.state.total_pnl += pnl
+        self.state.bankroll += pnl
+        self.state.total_trades += 1
+        self.state.daily_trade_count += 1
+
+        if pnl > 0:
+            self.state.winning_trades += 1
+            self.state.consecutive_losses = 0
+        else:
+            self.state.consecutive_losses += 1
+            self.state.last_loss_time = time.time()
+
+        if self.state.bankroll > self.state.peak_bankroll:
+            self.state.peak_bankroll = self.state.bankroll
+
+        self._save_state()
 
     def reset_daily_pnl(self):
         """Reset daily P&L counter (call at start of each trading day)."""

@@ -19,7 +19,7 @@ from typing import Optional
 
 import requests
 
-from config import CONFIG, CITIES, GAMMA_API_URL, PROXIES, OPENMETEO_URL
+from config import CONFIG, CITIES, GAMMA_API_URL, PROXIES, OPENMETEO_URL, ODDS_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +348,212 @@ def _normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + sign * y)
 
 
+class SportsOddsClient:
+    """Fetches bookmaker odds from The Odds API for cross-referencing.
+
+    Free tier: 500 requests/month. Supports soccer, basketball, baseball,
+    hockey, MMA, esports, and more. Returns odds from Pinnacle, Betfair,
+    DraftKings, FanDuel, and other sharp books.
+    """
+
+    ODDS_API_URL = "https://api.the-odds-api.com/v4"
+
+    SPORT_KEYS = {
+        "soccer_epl": "soccer_epl",
+        "soccer_uefa_champs_league": "soccer_uefa_champs_league",
+        "soccer_spain_la_liga": "soccer_spain_la_liga",
+        "soccer_germany_bundesliga": "soccer_germany_bundesliga",
+        "soccer_italy_serie_a": "soccer_italy_serie_a",
+        "soccer_france_ligue_one": "soccer_france_ligue_one",
+        "soccer_uefa_europa_league": "soccer_uefa_europa_league",
+        "basketball_nba": "basketball_nba",
+        "basketball_ncaab": "basketball_ncaab",
+        "baseball_mlb": "baseball_mlb",
+        "icehockey_nhl": "icehockey_nhl",
+        "mma_mixed_martial_arts": "mma_mixed_martial_arts",
+        "americanfootball_nfl": "americanfootball_nfl",
+        "soccer_fifa_world_cup": "soccer_fifa_world_cup",
+    }
+
+    TEAM_ALIASES = {
+        "man city": "manchester city", "man utd": "manchester united",
+        "man united": "manchester united", "spurs": "tottenham hotspur",
+        "tottenham": "tottenham hotspur", "wolves": "wolverhampton wanderers",
+        "wolverhampton": "wolverhampton wanderers",
+        "atletico": "atletico madrid", "atletico madrid": "atletico madrid",
+        "barca": "barcelona", "fc barcelona": "barcelona",
+        "real": "real madrid", "psg": "paris saint-germain",
+        "paris saint germain": "paris saint-germain",
+        "bayern": "bayern munich", "bayern munchen": "bayern munich",
+        "inter": "inter milan", "ac milan": "ac milan",
+        "juve": "juventus", "napoli": "napoli",
+        "dortmund": "borussia dortmund", "bvb": "borussia dortmund",
+        "lakers": "los angeles lakers", "celtics": "boston celtics",
+        "warriors": "golden state warriors", "knicks": "new york knicks",
+        "nets": "brooklyn nets", "sixers": "philadelphia 76ers",
+        "76ers": "philadelphia 76ers", "heat": "miami heat",
+        "bucks": "milwaukee bucks", "thunder": "oklahoma city thunder",
+        "nuggets": "denver nuggets", "suns": "phoenix suns",
+        "mavs": "dallas mavericks", "mavericks": "dallas mavericks",
+        "yankees": "new york yankees", "dodgers": "los angeles dodgers",
+        "red sox": "boston red sox", "cubs": "chicago cubs",
+        "diamondbacks": "arizona diamondbacks", "d-backs": "arizona diamondbacks",
+        "chelsea": "chelsea", "arsenal": "arsenal", "liverpool": "liverpool",
+        "west ham": "west ham united", "newcastle": "newcastle united",
+        "aston villa": "aston villa", "everton": "everton",
+        "leicester": "leicester city", "crystal palace": "crystal palace",
+    }
+
+    def __init__(self):
+        self.api_key = ODDS_API_KEY
+        self.session = requests.Session()
+        self._odds_cache = {}
+        self._cache_time = 0
+        self._remaining_requests = None
+
+    def _normalize_team(self, name: str) -> str:
+        name = name.lower().strip()
+        return self.TEAM_ALIASES.get(name, name)
+
+    def get_upcoming_odds(self) -> dict:
+        """Fetch odds for all supported sports. Returns {normalized_matchup: {home_prob, away_prob, draw_prob, source}}."""
+        if not self.api_key:
+            return {}
+
+        now = time.time()
+        if self._odds_cache and (now - self._cache_time) < 600:
+            return self._odds_cache
+
+        all_odds = {}
+        for sport_key in self.SPORT_KEYS.values():
+            try:
+                resp = self.session.get(
+                    f"{self.ODDS_API_URL}/sports/{sport_key}/odds",
+                    params={
+                        "apiKey": self.api_key,
+                        "regions": "us,eu,uk",
+                        "markets": "h2h",
+                        "oddsFormat": "decimal",
+                        "bookmakers": "pinnacle,betfair_ex_eu,draftkings,fanduel,williamhill_us",
+                    },
+                    timeout=15,
+                )
+                if resp.status_code == 401:
+                    logger.warning("Odds API key invalid or missing")
+                    return {}
+                if resp.status_code == 429:
+                    logger.warning("Odds API rate limit reached")
+                    break
+                if resp.status_code != 200:
+                    continue
+
+                self._remaining_requests = resp.headers.get("x-requests-remaining")
+                events = resp.json()
+
+                for event in events:
+                    home = self._normalize_team(event.get("home_team", ""))
+                    away = self._normalize_team(event.get("away_team", ""))
+                    commence = event.get("commence_time", "")
+
+                    sharp_probs = self._extract_sharp_probs(event.get("bookmakers", []))
+                    if sharp_probs:
+                        matchup_key = f"{home} vs {away}"
+                        all_odds[matchup_key] = {
+                            **sharp_probs,
+                            "home_team": home,
+                            "away_team": away,
+                            "commence_time": commence,
+                            "sport": sport_key,
+                        }
+                        reverse_key = f"{away} vs {home}"
+                        all_odds[reverse_key] = {
+                            "home_prob": sharp_probs.get("away_prob", 0),
+                            "away_prob": sharp_probs.get("home_prob", 0),
+                            "draw_prob": sharp_probs.get("draw_prob", 0),
+                            "home_team": away,
+                            "away_team": home,
+                            "commence_time": commence,
+                            "sport": sport_key,
+                        }
+
+                time.sleep(0.3)
+            except Exception as e:
+                logger.debug(f"Failed to fetch odds for {sport_key}: {e}")
+                continue
+
+        self._odds_cache = all_odds
+        self._cache_time = time.time()
+        logger.info(f"Fetched odds for {len(all_odds) // 2} upcoming matches across {len(self.SPORT_KEYS)} sports "
+                    f"(API requests remaining: {self._remaining_requests})")
+        return all_odds
+
+    def _extract_sharp_probs(self, bookmakers: list) -> Optional[dict]:
+        """Extract implied probabilities from sharpest available bookmaker.
+
+        Priority: Pinnacle (sharpest) > Betfair > others.
+        Converts decimal odds to implied probability, removes vig using
+        multiplicative method (standard industry approach).
+        """
+        sharp_order = ["pinnacle", "betfair_ex_eu", "williamhill_us", "draftkings", "fanduel"]
+        for target_book in sharp_order:
+            for book in bookmakers:
+                if book.get("key") == target_book:
+                    markets = book.get("markets", [])
+                    for market in markets:
+                        if market.get("key") == "h2h":
+                            outcomes = market.get("outcomes", [])
+                            if len(outcomes) < 2:
+                                continue
+                            raw_probs = {}
+                            for o in outcomes:
+                                price = o.get("price", 0)
+                                if price > 1:
+                                    raw_probs[o["name"]] = 1.0 / price
+                            total = sum(raw_probs.values())
+                            if total <= 0:
+                                continue
+                            fair_probs = {k: v / total for k, v in raw_probs.items()}
+                            result = {"home_prob": 0, "away_prob": 0, "draw_prob": 0}
+                            for name, prob in fair_probs.items():
+                                name_lower = name.lower()
+                                if name_lower == "draw":
+                                    result["draw_prob"] = prob
+                                elif len(fair_probs) == 2:
+                                    if result["home_prob"] == 0:
+                                        result["home_prob"] = prob
+                                    else:
+                                        result["away_prob"] = prob
+                                else:
+                                    if result["home_prob"] == 0:
+                                        result["home_prob"] = prob
+                                    elif result["away_prob"] == 0:
+                                        result["away_prob"] = prob
+                            result["source"] = target_book
+                            return result
+        return None
+
+    def find_match_odds(self, team1: str, team2: str = "") -> Optional[dict]:
+        """Find odds for a specific matchup by team name fuzzy matching."""
+        odds = self.get_upcoming_odds()
+        if not odds:
+            return None
+
+        t1 = self._normalize_team(team1)
+        t2 = self._normalize_team(team2) if team2 else ""
+
+        for key, data in odds.items():
+            home = data.get("home_team", "")
+            away = data.get("away_team", "")
+            if t1 in home or t1 in away:
+                if not t2 or t2 in home or t2 in away:
+                    return data
+            if t1 in key:
+                if not t2 or t2 in key:
+                    return data
+
+        return None
+
+
 class MarketAnalyzer:
     """Analyzes Polymarket markets to find mispriced opportunities."""
 
@@ -360,6 +566,7 @@ class MarketAnalyzer:
         if PROXIES:
             self.session.proxies.update(PROXIES)
         self.crypto = CryptoDataClient()
+        self.sports = SportsOddsClient()
 
     def fetch_all_active_markets(self, limit: int = None) -> list[dict]:
         """Fetch ALL active markets from Polymarket Gamma API.
@@ -416,12 +623,38 @@ class MarketAnalyzer:
         ]
         if any(re.search(p, question) for p in crypto_patterns):
             return "crypto"
-        if any(kw in question for kw in ["win the", "nba", "nfl", "mlb", "nhl", "fifa", "premier league",
-                                          "champions league", "world cup", "super bowl", "playoff"]):
+        sports_keywords = [
+            "win the", "nba", "nfl", "mlb", "nhl", "fifa", "premier league",
+            "champions league", "world cup", "super bowl", "playoff",
+            "la liga", "serie a", "bundesliga", "ligue 1", "europa league",
+            "ncaa", "ncaab", "march madness", " vs.", " vs ",
+            "f1 ", "formula 1", "grand prix", "mma", "ufc",
+            "boxing", "tennis", "atp", "wta", "wimbledon",
+            "mvp", "champion", "championship",
+            "dodgers", "yankees", "lakers", "celtics", "warriors",
+            "arsenal", "chelsea", "liverpool", "manchester", "real madrid",
+            "barcelona", "bayern", "juventus", "psg", "inter milan",
+            "esports", "cs2", "counter-strike", "valorant", "league of legends",
+        ]
+        if any(kw in question for kw in sports_keywords):
             return "sports"
-        if any(kw in question for kw in ["president", "trump", "biden", "election", "congress", "senate",
-                                          "governor", "democrat", "republican", "vote"]):
+        if any(t in tags for t in ["sports", "soccer", "football", "basketball",
+                                    "baseball", "hockey", "esports", "mma", "tennis"]):
+            return "sports"
+        politics_keywords = [
+            "president", "trump", "biden", "election", "congress", "senate",
+            "governor", "democrat", "republican", "vote", "parliamentary",
+            "prime minister", "cabinet", "impeach", "nominee", "ballot",
+        ]
+        if any(kw in question for kw in politics_keywords):
             return "politics"
+        finance_keywords = [
+            "fed ", "federal reserve", "interest rate", "bps", "basis point",
+            "ipo", "s&p 500", "nasdaq", "dow jones", "crude oil",
+            "gdp", "inflation", "cpi", "fomc", "tariff",
+        ]
+        if any(kw in question for kw in finance_keywords):
+            return "finance"
         return "event"
 
     def analyze_crypto_market(self, market: dict) -> Optional[Opportunity]:
@@ -673,9 +906,11 @@ class MarketAnalyzer:
 
         # Kelly sizing
         if market_price > 0 and market_price < 1 and estimated_prob > market_price:
-            b = (1.0 - market_price) / market_price
+            fee_rate = CONFIG.get("fee_rate", 0.02)
+            net_win = ((1.0 - market_price) / market_price) * (1.0 - fee_rate)
+            b = net_win
             q = 1.0 - estimated_prob
-            kelly_full = (estimated_prob * b - q) / b
+            kelly_full = (estimated_prob * b - q) / b if b > 0 else 0
             kelly_size = max(0, kelly_full * CONFIG["kelly_fraction"] * CONFIG["bankroll"])
             kelly_size = min(kelly_size, CONFIG["max_position_usd"])
         else:
@@ -817,6 +1052,297 @@ class MarketAnalyzer:
                         kelly_size=min(CONFIG["max_position_usd"],
                                       CONFIG["kelly_fraction"] * CONFIG["bankroll"] * 0.5),
                     )
+        except (ValueError, TypeError):
+            pass
+
+        return None
+
+    def analyze_sports_market(self, market: dict) -> Optional[Opportunity]:
+        """Cross-reference Polymarket sports prices against bookmaker odds.
+
+        Strategy: top Polymarket traders make millions by finding mispricings
+        between Polymarket and sharp bookmakers (Pinnacle, Betfair). When
+        Polymarket prices diverge from sharp book implied probabilities by
+        more than the fee threshold, there's an edge.
+        """
+        question = market.get("question", "")
+        outcomes = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
+        outcome_prices = json.loads(market.get("outcomePrices", "[]")) if isinstance(market.get("outcomePrices"), str) else market.get("outcomePrices", [])
+
+        if len(outcomes) < 2 or len(outcome_prices) < 2:
+            return None
+
+        volume = float(market.get("volume", 0))
+        liquidity = float(market.get("liquidity", 0))
+        end_date = market.get("endDate", "")[:10]
+
+        if volume < CONFIG.get("sports_min_volume", 5000):
+            return None
+        if liquidity < CONFIG.get("sports_min_liquidity", 200):
+            return None
+
+        tokens = market.get("tokens", [])
+        token_map = {}
+        for token in tokens:
+            token_map[token.get("outcome", "").lower()] = token.get("token_id", "")
+
+        outcome_data = {}
+        for i, outcome in enumerate(outcomes):
+            price = float(outcome_prices[i]) if i < len(outcome_prices) else 0
+            outcome_data[outcome] = price
+
+        teams = self._extract_teams_from_question(question, outcomes)
+        if not teams:
+            return self._analyze_sports_near_expiry(market, outcomes, outcome_prices, token_map, volume, liquidity, end_date)
+
+        odds_data = self.sports.find_match_odds(teams[0], teams[1] if len(teams) > 1 else "")
+        if not odds_data:
+            return self._analyze_sports_near_expiry(market, outcomes, outcome_prices, token_map, volume, liquidity, end_date)
+
+        best_opp = None
+        best_edge = 0
+
+        for outcome_name, poly_price in outcome_data.items():
+            if poly_price < 0.05 or poly_price > 0.95:
+                continue
+
+            book_prob = self._match_outcome_to_odds(outcome_name, odds_data, question)
+            if book_prob is None or book_prob <= 0:
+                continue
+
+            edge = book_prob - poly_price
+            min_edge = CONFIG.get("sports_min_edge", 0.04)
+
+            if edge > min_edge and edge > best_edge:
+                fee_rate = CONFIG.get("fee_rate", 0.02)
+                net_win = (1.0 - poly_price) * (1.0 - fee_rate)
+                loss = poly_price
+                kelly_full = (book_prob * net_win - (1 - book_prob) * loss) / net_win if net_win > 0 else 0
+                kelly_size = max(0, kelly_full * CONFIG["kelly_fraction"] * CONFIG["bankroll"])
+                kelly_size = min(kelly_size, CONFIG["max_position_usd"])
+
+                if kelly_size < 0.10:
+                    continue
+
+                side = outcome_name.upper() if outcome_name.upper() in ("YES", "NO") else "YES"
+                token_id = token_map.get(outcome_name.lower(), "")
+
+                confidence = "high" if edge > 0.08 else "medium"
+
+                best_opp = Opportunity(
+                    category="sports",
+                    market_question=question,
+                    market_id=market.get("conditionId", market.get("condition_id", "")),
+                    token_id=token_id,
+                    side=side,
+                    market_price=round(poly_price, 4),
+                    estimated_prob=round(book_prob, 4),
+                    edge=round(edge, 4),
+                    confidence=confidence,
+                    reasoning=(f"Bookmaker edge: {odds_data.get('source', 'unknown')} implies "
+                              f"{book_prob:.1%} vs Polymarket {poly_price:.1%} "
+                              f"({edge:.1%} edge). Vol ${volume:,.0f}"),
+                    volume=volume,
+                    liquidity=liquidity,
+                    end_date=end_date,
+                    kelly_size=round(kelly_size, 2),
+                )
+                best_edge = edge
+
+        return best_opp
+
+    def _extract_teams_from_question(self, question: str, outcomes: list) -> list[str]:
+        """Extract team names from market question or outcomes."""
+        vs_match = re.search(r'(.+?)\s+(?:vs\.?|versus)\s+(.+?)(?:\?|$|\s+[-–])', question, re.IGNORECASE)
+        if vs_match:
+            return [vs_match.group(1).strip(), vs_match.group(2).strip()]
+
+        clean_outcomes = [o for o in outcomes if o.lower() not in ("yes", "no", "draw")]
+        if len(clean_outcomes) >= 2:
+            return clean_outcomes[:2]
+        if len(clean_outcomes) == 1:
+            return clean_outcomes
+
+        return []
+
+    def _match_outcome_to_odds(self, outcome_name: str, odds_data: dict, question: str) -> Optional[float]:
+        """Match a Polymarket outcome to bookmaker probability."""
+        outcome_lower = self.sports._normalize_team(outcome_name)
+        home = odds_data.get("home_team", "")
+        away = odds_data.get("away_team", "")
+
+        if outcome_lower == "draw" or outcome_name.lower() == "draw":
+            return odds_data.get("draw_prob", 0) or None
+
+        if outcome_lower in home or home in outcome_lower:
+            return odds_data.get("home_prob")
+        if outcome_lower in away or away in outcome_lower:
+            return odds_data.get("away_prob")
+
+        for word in outcome_lower.split():
+            if len(word) > 3:
+                if word in home:
+                    return odds_data.get("home_prob")
+                if word in away:
+                    return odds_data.get("away_prob")
+
+        if outcome_name.lower() == "yes":
+            q_lower = question.lower()
+            if home in q_lower and away not in q_lower:
+                return odds_data.get("home_prob")
+            if away in q_lower and home not in q_lower:
+                return odds_data.get("away_prob")
+
+        return None
+
+    def _analyze_sports_near_expiry(self, market: dict, outcomes: list, outcome_prices: list,
+                                     token_map: dict, volume: float, liquidity: float,
+                                     end_date: str) -> Optional[Opportunity]:
+        """Fallback for sports markets without bookmaker odds — use near-expiry logic.
+
+        Sports favorites at 85-95c resolving soon are often underpriced
+        (favorite-longshot bias applies to sports too).
+        """
+        if not end_date:
+            return None
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+        except (ValueError, TypeError):
+            return None
+
+        if hours_left < 0 or hours_left > 48:
+            return None
+
+        for i, outcome in enumerate(outcomes):
+            price = float(outcome_prices[i]) if i < len(outcome_prices) else 0
+            if 0.85 <= price <= 0.95 and volume > 10000:
+                estimated_prob = min(0.98, price + 0.04)
+                edge = estimated_prob - price
+                if edge < CONFIG.get("sports_min_edge", 0.04):
+                    continue
+
+                fee_rate = CONFIG.get("fee_rate", 0.02)
+                net_win = (1.0 - price) * (1.0 - fee_rate)
+                kelly_full = (estimated_prob * net_win - (1 - estimated_prob) * price) / net_win if net_win > 0 else 0
+                kelly_size = max(0, kelly_full * CONFIG["kelly_fraction"] * CONFIG["bankroll"])
+                kelly_size = min(kelly_size, CONFIG["max_position_usd"])
+
+                if kelly_size < 0.10:
+                    continue
+
+                side = outcome.upper() if outcome.upper() in ("YES", "NO") else "YES"
+                token_id = token_map.get(outcome.lower(), "")
+
+                return Opportunity(
+                    category="sports",
+                    market_question=market.get("question", ""),
+                    market_id=market.get("conditionId", market.get("condition_id", "")),
+                    token_id=token_id,
+                    side=side,
+                    market_price=round(price, 4),
+                    estimated_prob=round(estimated_prob, 4),
+                    edge=round(edge, 4),
+                    confidence="medium",
+                    reasoning=(f"Sports near-expiry: {hours_left:.0f}h left, "
+                              f"favorite at {price:.1%}, vol ${volume:,.0f}"),
+                    volume=volume,
+                    liquidity=liquidity,
+                    end_date=end_date,
+                    kelly_size=round(kelly_size, 2),
+                )
+
+        return None
+
+    def analyze_finance_market(self, market: dict) -> Optional[Opportunity]:
+        """Analyze finance/macro markets (Fed decisions, oil prices, etc).
+
+        Uses consensus data: Fed futures imply probabilities for rate decisions,
+        oil futures for price targets, etc.
+        """
+        question = market.get("question", "")
+        outcomes = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
+        outcome_prices = json.loads(market.get("outcomePrices", "[]")) if isinstance(market.get("outcomePrices"), str) else market.get("outcomePrices", [])
+
+        if len(outcomes) < 2 or len(outcome_prices) < 2:
+            return None
+
+        volume = float(market.get("volume", 0))
+        liquidity = float(market.get("liquidity", 0))
+        end_date = market.get("endDate", "")[:10]
+
+        if volume < 5000 or liquidity < 200:
+            return None
+
+        tokens = market.get("tokens", [])
+        token_map = {}
+        for token in tokens:
+            token_map[token.get("outcome", "").lower()] = token.get("token_id", "")
+
+        yes_price = 0
+        no_price = 0
+        for i, outcome in enumerate(outcomes):
+            price = float(outcome_prices[i]) if i < len(outcome_prices) else 0
+            if outcome.lower() == "yes":
+                yes_price = price
+            elif outcome.lower() == "no":
+                no_price = price
+
+        q_lower = question.lower()
+
+        fed_patterns = ["fed ", "fomc", "interest rate", "rate cut", "rate hike", "basis point", "bps"]
+        if any(p in q_lower for p in fed_patterns):
+            if "no change" in q_lower or "hold" in q_lower or "unchanged" in q_lower:
+                if yes_price > 0.90:
+                    estimated_prob = min(0.98, yes_price + 0.03)
+                    edge = estimated_prob - yes_price
+                    if edge > CONFIG["entry_threshold"]:
+                        return Opportunity(
+                            category="finance",
+                            market_question=question,
+                            market_id=market.get("conditionId", ""),
+                            token_id=token_map.get("yes", ""),
+                            side="YES",
+                            market_price=round(yes_price, 4),
+                            estimated_prob=round(estimated_prob, 4),
+                            edge=round(edge, 4),
+                            confidence="high",
+                            reasoning=f"Fed hold consensus strong at {yes_price:.1%}, vol ${volume:,.0f}",
+                            volume=volume,
+                            liquidity=liquidity,
+                            end_date=end_date,
+                            kelly_size=min(CONFIG["max_position_usd"],
+                                          CONFIG["kelly_fraction"] * CONFIG["bankroll"]),
+                        )
+
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            days_left = (end_dt - datetime.now(timezone.utc)).days
+            if days_left <= 3 and volume > 20000:
+                for i, outcome in enumerate(outcomes):
+                    price = float(outcome_prices[i]) if i < len(outcome_prices) else 0
+                    if 0.88 <= price <= 0.96:
+                        estimated_prob = min(0.98, price + 0.04)
+                        edge = estimated_prob - price
+                        if edge > CONFIG["entry_threshold"]:
+                            side = outcome.upper() if outcome.upper() in ("YES", "NO") else "YES"
+                            return Opportunity(
+                                category="finance",
+                                market_question=question,
+                                market_id=market.get("conditionId", ""),
+                                token_id=token_map.get(outcome.lower(), ""),
+                                side=side,
+                                market_price=round(price, 4),
+                                estimated_prob=round(estimated_prob, 4),
+                                edge=round(edge, 4),
+                                confidence="medium",
+                                reasoning=f"Finance near-expiry: {days_left}d left, {price:.1%}, vol ${volume:,.0f}",
+                                volume=volume,
+                                liquidity=liquidity,
+                                end_date=end_date,
+                                kelly_size=min(CONFIG["max_position_usd"],
+                                              CONFIG["kelly_fraction"] * CONFIG["bankroll"] * 0.5),
+                            )
         except (ValueError, TypeError):
             pass
 
@@ -1169,6 +1695,10 @@ class MarketAnalyzer:
                 opp = None
                 if category == "crypto":
                     opp = self.analyze_crypto_market(market)
+                elif category == "sports":
+                    opp = self.analyze_sports_market(market)
+                elif category == "finance":
+                    opp = self.analyze_finance_market(market)
                 elif category in ("event", "politics"):
                     opp = self.analyze_event_market(market)
                 # Weather handled by weather_scanner.py
@@ -1209,10 +1739,13 @@ class MarketAnalyzer:
         n_dutch = sum(1 for o in opportunities if o.category == 'dutch_book')
         n_arb = sum(1 for o in opportunities if o.category == 'arbitrage')
         n_near = sum(1 for o in opportunities if o.category == 'near_expiry')
+        n_sports = sum(1 for o in opportunities if o.category == 'sports')
+        n_finance = sum(1 for o in opportunities if o.category == 'finance')
         n_urgent = sum(1 for o in opportunities if '[URGENT' in o.reasoning or '[CLOSING' in o.reasoning)
 
         logger.info(f"Found {len(opportunities)} opportunities across {len(markets)} markets "
-                    f"(dutch_book: {n_dutch}, arb: {n_arb}, near_expiry: {n_near}, urgent<48h: {n_urgent})")
+                    f"(dutch_book: {n_dutch}, arb: {n_arb}, near_expiry: {n_near}, "
+                    f"sports: {n_sports}, finance: {n_finance}, urgent<48h: {n_urgent})")
         return opportunities
 
 

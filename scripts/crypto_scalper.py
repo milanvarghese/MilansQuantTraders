@@ -1,8 +1,9 @@
-"""Pro-grade crypto scalping bot v3.4 — research-backed, multi-signal confluence.
+"""Pro-grade crypto scalping bot v3.5 — research-backed, multi-signal confluence.
 
 Architecture:
 1. DYNAMIC PAIR DISCOVERY — scans Coinbase for all liquid USD pairs, refreshes hourly
 2. REGIME DETECTION — ADX classifies trending vs ranging, adapts strategy
+   MACRO REGIME SYSTEM — composite scoring (F&G, vol, ADX, breadth, WR) with 5 profiles
 3. MULTI-TIMEFRAME — 1H trend direction, 5M entry timing
 4. CONFLUENCE SCORING — 0-17 scale with signal performance weighting
 5. ORDER BOOK IMBALANCE — confirms direction from Coinbase L2 book
@@ -22,6 +23,15 @@ Architecture:
 19. PROGRESSIVE STOP TIGHTENING — gradually tighten SL in second half of hold
 20. PAIR WHITELIST — restrict to backtest-validated profitable pairs
 21. BIDIRECTIONAL TRADING — both long (buy) and short (sell) signals
+22. ADAPTIVE MACRO REGIME — 5 market profiles with auto-switching and side bias
+
+v3.5 changes:
+- Adaptive macro regime system: 5 profiles (TRENDING_BULL, TRENDING_BEAR, HIGH_VOL_FEAR,
+  LOW_VOL_CHOP, RECOVERY) with composite scoring from F&G, BTC vol, ADX, breadth, WR
+- Each profile overrides TP/SL/confluence/sizing/hold time/position limits
+- Side bias: +1-2 confluence bonus for preferred direction per regime
+- Anti-whipsaw: hysteresis bonus, 3-scan confirmation, 10-scan lockout
+- Regime-aware auto-tuning: tracks performance per macro regime
 
 v3.4 changes:
 - Funding rate fallback chain: Binance -> dYdX -> OKX (fixes geo-blocking on US servers)
@@ -40,6 +50,7 @@ Paper trades by default. Uses real market data from Coinbase + dYdX/OKX.
 """
 
 import argparse
+import copy
 import csv
 import json
 import logging
@@ -51,6 +62,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
+from enum import Enum
 from typing import Optional
 
 import requests
@@ -82,7 +94,7 @@ SCALPER_CONFIG = {
     "min_ranging_score": 5,          # Higher bar in ranging markets (backtest: 11% WR otherwise)
     # Pair whitelist: only trade backtest-validated profitable pairs
     # Set to None/empty to trade all pairs from dynamic discovery
-    "pair_whitelist": ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "ATOM", "SUI", "NEAR", "INJ", "ARB", "OP", "FET", "RENDER", "SEI", "APT", "TIA", "TAO"],
+    "pair_whitelist": ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "ATOM", "SUI", "NEAR", "INJ", "ARB", "OP", "FET", "RENDER", "SEI", "APT", "TIA", "TAO", "PEPE", "SHIB", "WIF", "BONK", "DOT", "MATIC", "LTC", "UNI", "AAVE", "MKR"],
     # Regime-adaptive thresholds
     "adx_trending": 25,              # ADX > 25 = trending
     "adx_ranging": 20,               # ADX < 20 = ranging
@@ -611,7 +623,7 @@ def find_swing_levels(candles: list[dict], num_levels: int = 3) -> dict:
 
     return {
         "support": sorted(swing_lows)[-num_levels:] if swing_lows else [],
-        "resistance": sorted(swing_highs)[:num_levels] if swing_highs else [],
+        "resistance": sorted(swing_highs)[-num_levels:] if swing_highs else [],
     }
 
 
@@ -1232,6 +1244,297 @@ class SignalBandit:
 
 
 # ================================================================
+# ADAPTIVE MACRO REGIME SYSTEM (v3.5)
+# ================================================================
+
+class MacroRegime(Enum):
+    """Five macro market regimes with distinct trading profiles."""
+    TRENDING_BULL = "trending_bull"
+    TRENDING_BEAR = "trending_bear"
+    HIGH_VOL_FEAR = "high_vol_fear"
+    LOW_VOL_CHOP = "low_vol_chop"
+    RECOVERY = "recovery"
+
+
+# Parameter overrides per regime. Keys must match SCALPER_CONFIG keys.
+# 'side_bias' and 'side_bias_bonus' are new keys consumed by SignalDetector.
+REGIME_PROFILES = {
+    MacroRegime.TRENDING_BULL: {
+        "tp_atr_mult": 5.0,
+        "sl_atr_mult": 3.5,
+        "min_confluence_score": 5,
+        "min_ranging_score": 6,
+        "kelly_fraction": 0.12,
+        "max_position_usd": 5.00,
+        "max_open_positions": 8,
+        "max_hold_hours": 48,
+        "cooldown_after_loss_sec": 120,
+        "progressive_stop_start_pct": 0.6,
+        "progressive_stop_end_mult": 0.4,
+        "side_bias": "long",
+        "side_bias_bonus": 1,
+    },
+    MacroRegime.TRENDING_BEAR: {
+        "tp_atr_mult": 3.0,
+        "sl_atr_mult": 2.5,
+        "min_confluence_score": 6,
+        "min_ranging_score": 7,
+        "kelly_fraction": 0.07,
+        "max_position_usd": 3.00,
+        "max_open_positions": 5,
+        "max_hold_hours": 24,
+        "cooldown_after_loss_sec": 300,
+        "progressive_stop_start_pct": 0.4,
+        "progressive_stop_end_mult": 0.2,
+        "side_bias": "short",
+        "side_bias_bonus": 2,
+    },
+    MacroRegime.HIGH_VOL_FEAR: {
+        "tp_atr_mult": 2.5,
+        "sl_atr_mult": 2.0,
+        "min_confluence_score": 7,
+        "min_ranging_score": 8,
+        "kelly_fraction": 0.05,
+        "max_position_usd": 2.00,
+        "max_open_positions": 3,
+        "max_hold_hours": 12,
+        "cooldown_after_loss_sec": 600,
+        "progressive_stop_start_pct": 0.3,
+        "progressive_stop_end_mult": 0.15,
+        "side_bias": "short",
+        "side_bias_bonus": 2,
+    },
+    MacroRegime.LOW_VOL_CHOP: {
+        "tp_atr_mult": 3.0,
+        "sl_atr_mult": 2.5,
+        "min_confluence_score": 7,
+        "min_ranging_score": 8,
+        "kelly_fraction": 0.04,
+        "max_position_usd": 2.00,
+        "max_open_positions": 2,
+        "max_hold_hours": 12,
+        "cooldown_after_loss_sec": 900,
+        "progressive_stop_start_pct": 0.3,
+        "progressive_stop_end_mult": 0.2,
+        "side_bias": None,
+        "side_bias_bonus": 0,
+    },
+    MacroRegime.RECOVERY: {
+        "tp_atr_mult": 4.0,
+        "sl_atr_mult": 3.0,
+        "min_confluence_score": 5,
+        "min_ranging_score": 6,
+        "kelly_fraction": 0.08,
+        "max_position_usd": 3.50,
+        "max_open_positions": 6,
+        "max_hold_hours": 30,
+        "cooldown_after_loss_sec": 240,
+        "progressive_stop_start_pct": 0.5,
+        "progressive_stop_end_mult": 0.3,
+        "side_bias": "long",
+        "side_bias_bonus": 1,
+    },
+}
+
+
+class RegimeDetector:
+    """Composite macro regime detector with hysteresis.
+
+    Combines Fear & Greed, BTC volatility, average ADX, rolling win rate,
+    and market breadth into a regime classification. Uses sticky scoring
+    and confirmation to prevent whipsawing between regimes.
+    """
+
+    HYSTERESIS_BONUS = 0.15
+    CONFIRM_SCANS = 3      # Consecutive scans before switching
+    LOCKOUT_SCANS = 10     # Minimum scans between switches
+
+    def __init__(self):
+        self._current = MacroRegime.TRENDING_BEAR  # Safe default for bear markets
+        self._candidate = None
+        self._candidate_count = 0
+        self._locked_until = 0
+        self._cycle = 0
+        self._fg_history = deque(maxlen=24)  # ~24 scans of F&G history
+
+    @property
+    def current_regime(self) -> MacroRegime:
+        return self._current
+
+    @property
+    def regime_age(self) -> int:
+        """Number of scans since last regime switch."""
+        return self._cycle - max(0, self._locked_until - self.LOCKOUT_SCANS)
+
+    def detect(self, fear_greed: int, btc_vol_ratio: float,
+               avg_adx: float, rolling_wr: float,
+               market_breadth: float) -> MacroRegime:
+        """Detect current macro regime from composite inputs."""
+        self._cycle += 1
+        self._fg_history.append(fear_greed)
+
+        scores = self._score_all(fear_greed, btc_vol_ratio, avg_adx,
+                                 rolling_wr, market_breadth)
+
+        # Hysteresis: current regime gets a bonus (must be clearly beaten)
+        scores[self._current] += self.HYSTERESIS_BONUS
+
+        best = max(scores, key=scores.get)
+
+        # If current regime still wins, reset candidate
+        if best == self._current:
+            self._candidate = None
+            self._candidate_count = 0
+            return self._current
+
+        # Lockout check
+        if self._cycle < self._locked_until:
+            return self._current
+
+        # Confirmation: need CONFIRM_SCANS consecutive cycles
+        if best == self._candidate:
+            self._candidate_count += 1
+        else:
+            self._candidate = best
+            self._candidate_count = 1
+
+        if self._candidate_count >= self.CONFIRM_SCANS:
+            old = self._current
+            self._current = best
+            self._candidate = None
+            self._candidate_count = 0
+            self._locked_until = self._cycle + self.LOCKOUT_SCANS
+            logger.info(f"MACRO REGIME CHANGE: {old.value} -> {best.value}")
+            return best
+
+        return self._current
+
+    def _score_all(self, fg: int, vol: float, adx: float,
+                   wr: float, breadth: float) -> dict:
+        """Compute regime scores (0-1 scale) for all five regimes."""
+        # Normalize inputs to 0-1
+        fg_n = max(0, min(100, fg)) / 100.0            # 0=fear, 1=greed
+        vol_n = max(0, min(1, (vol - 0.5) / 2.5))      # 0=low vol, 1=high vol
+        adx_n = max(0, min(1, (adx - 10) / 40.0))      # 0=no trend, 1=strong trend
+        # breadth already 0-1 (fraction of bullish pairs)
+        # wr already 0-1
+
+        # F&G trend: is fear_greed rising? (recovery signal)
+        fg_rising = 0.0
+        if len(self._fg_history) >= 6:
+            recent_avg = sum(list(self._fg_history)[-6:]) / 6
+            older_avg = sum(list(self._fg_history)[:max(1, len(self._fg_history) - 6)]) / max(1, len(self._fg_history) - 6)
+            if recent_avg > older_avg + 3:
+                fg_rising = min(1.0, (recent_avg - older_avg) / 15.0)
+
+        scores = {}
+
+        # TRENDING_BULL: high F&G, strong trend, most pairs bullish, winning
+        scores[MacroRegime.TRENDING_BULL] = (
+            0.30 * fg_n +
+            0.20 * adx_n +
+            0.25 * breadth +
+            0.15 * wr +
+            0.10 * (1.0 - vol_n)  # Calm bull preferred
+        )
+
+        # TRENDING_BEAR: low F&G, strong trend, most pairs bearish, losing
+        scores[MacroRegime.TRENDING_BEAR] = (
+            0.30 * (1.0 - fg_n) +
+            0.20 * adx_n +
+            0.25 * (1.0 - breadth) +
+            0.15 * (1.0 - wr) +
+            0.10 * min(0.7, vol_n)  # Moderate vol is bearish, extreme is fear
+        )
+
+        # HIGH_VOL_FEAR: very low F&G + high vol
+        fear_intensity = max(0, (25 - fg) / 25.0) if fg < 25 else 0.0
+        scores[MacroRegime.HIGH_VOL_FEAR] = (
+            0.35 * fear_intensity +
+            0.25 * vol_n +
+            0.15 * (1.0 - breadth) +
+            0.15 * (1.0 - wr) +
+            0.10 * adx_n  # Can be trending or not
+        )
+
+        # LOW_VOL_CHOP: low ADX, low vol, mid F&G
+        mid_fg = 1.0 - abs(fg_n - 0.5) * 2  # Peaks at F&G=50
+        scores[MacroRegime.LOW_VOL_CHOP] = (
+            0.30 * (1.0 - adx_n) +
+            0.25 * (1.0 - vol_n) +
+            0.20 * mid_fg +
+            0.15 * (0.5 - abs(breadth - 0.5)) * 2 +  # Mixed breadth
+            0.10 * (1.0 - abs(wr - 0.5) * 2)  # Middling WR
+        )
+
+        # RECOVERY: F&G rising from fear, improving WR
+        was_fearful = 1.0 if fg < 45 and len(self._fg_history) >= 3 else 0.0
+        scores[MacroRegime.RECOVERY] = (
+            0.30 * fg_rising +
+            0.25 * was_fearful * fg_rising +  # Must be rising FROM fear
+            0.20 * wr +
+            0.15 * breadth +
+            0.10 * (1.0 - vol_n)
+        )
+
+        return scores
+
+
+class RegimeAdapter:
+    """Applies regime-specific parameter overrides to the config dict.
+
+    Stores a snapshot of the original config so profiles can be cleanly
+    re-applied without accumulating drift from multiple switches.
+    """
+
+    # Keys that regime profiles can override
+    PROFILE_KEYS = {
+        "tp_atr_mult", "sl_atr_mult", "min_confluence_score", "min_ranging_score",
+        "kelly_fraction", "max_position_usd", "max_open_positions",
+        "max_hold_hours", "cooldown_after_loss_sec",
+        "progressive_stop_start_pct", "progressive_stop_end_mult",
+        "side_bias", "side_bias_bonus",
+    }
+
+    def __init__(self, profiles: dict, base_config: dict):
+        self._profiles = profiles
+        self._base = {k: base_config.get(k) for k in self.PROFILE_KEYS if k in base_config}
+        # side_bias/side_bias_bonus don't exist in base config — default to None/0
+        self._base.setdefault("side_bias", None)
+        self._base.setdefault("side_bias_bonus", 0)
+        self._applied = None
+
+    def apply(self, regime: MacroRegime, config: dict):
+        """Apply regime profile to config. No-op if regime unchanged."""
+        if regime == self._applied:
+            return
+
+        profile = self._profiles.get(regime, {})
+
+        # Reset all profile keys to base values first
+        for key in self.PROFILE_KEYS:
+            if key in self._base:
+                config[key] = self._base[key]
+
+        # Apply regime overrides
+        for key, value in profile.items():
+            config[key] = value
+
+        self._applied = regime
+        logger.info(
+            f"REGIME ADAPTER: {regime.value} — "
+            f"confluence={config.get('min_confluence_score')}, "
+            f"TP={config.get('tp_atr_mult')}x, SL={config.get('sl_atr_mult')}x, "
+            f"kelly={config.get('kelly_fraction')}, max_pos={config.get('max_open_positions')}, "
+            f"hold={config.get('max_hold_hours')}h, bias={config.get('side_bias')}"
+        )
+
+    @property
+    def applied_regime(self) -> MacroRegime:
+        return self._applied
+
+
+# ================================================================
 # MARKET CONTEXT (regime + external signals)
 # ================================================================
 
@@ -1241,6 +1544,7 @@ class MarketContext:
     pair: str
     # Regime
     regime: str = "unknown"         # "trending_up", "trending_down", "ranging", "volatile"
+    macro_regime: str = "unknown"   # Macro regime (v3.5): "trending_bull", "high_vol_fear", etc.
     adx: float = 0.0
     trend_direction: str = "neutral"  # "up", "down", "neutral"
     # Hourly trend
@@ -1659,6 +1963,15 @@ class SignalDetector:
                     weighted_bonus += (w - 1.0)
             sell_score += round(weighted_bonus)
 
+        # === MACRO REGIME SIDE BIAS (v3.5) ===
+        # Boost preferred direction's score based on current regime profile
+        side_bias = self.config.get("side_bias")
+        bias_bonus = self.config.get("side_bias_bonus", 0)
+        if bias_bonus and side_bias == "long":
+            score += bias_bonus
+        elif bias_bonus and side_bias == "short":
+            sell_score += bias_bonus
+
         # === QUALITY GRADING & SIGNAL SELECTION ===
         # Pick the stronger direction
         min_score = self.config["min_confluence_score"]
@@ -1811,6 +2124,13 @@ class CryptoScalper:
         self.vol_tracker = CrossAssetVolTracker()
         self.bandit = SignalBandit(decay=self.config.get("bandit_decay", 0.95))
         self.detector = SignalDetector(self.config, bandit=self.bandit)
+        # v3.5: Adaptive macro regime system
+        self._base_config = dict(self.config)  # Snapshot before regime overrides
+        self.regime_detector = RegimeDetector()
+        self._regime_profiles = copy.deepcopy(REGIME_PROFILES)
+        self.regime_adapter = RegimeAdapter(self._regime_profiles, self._base_config)
+        self._last_avg_adx = 20.0      # Warm-up default (transitional)
+        self._last_market_breadth = 0.5  # Warm-up default (neutral)
 
     def _load_state(self) -> ScalperState:
         if os.path.exists(STATE_FILE):
@@ -1846,9 +2166,10 @@ class CryptoScalper:
         os.replace(tmp, STATE_FILE)
 
     def _log_trade(self, action: str, data: dict):
+        write_header = not os.path.exists(TRADE_LOG) or os.path.getsize(TRADE_LOG) == 0
         with open(TRADE_LOG, "a", newline="") as f:
             writer = csv.writer(f)
-            if f.tell() == 0:
+            if write_header:
                 writer.writerow([
                     "timestamp", "action", "pair", "side", "price",
                     "shares", "cost_usd", "pnl", "signal_type",
@@ -2102,6 +2423,7 @@ class CryptoScalper:
             "confluence_score": signal.confluence_score,
             "quality_grade": signal.quality_grade,
             "regime": signal.regime,
+            "macro_regime": self.regime_detector.current_regime.value,
             "rsi_at_entry": signal.rsi,
             "reasoning": signal.reasoning,
             "take_profit": signal.take_profit,
@@ -2219,7 +2541,6 @@ class CryptoScalper:
                 if trailing_stop > pos["stop_loss"]:
                     pos["stop_loss"] = round(trailing_stop, 6)
                     logger.debug(f"[{pos['id']}] Trail ratcheted stop to {trailing_stop:.6f}")
-                    continue
                 if current < pos["stop_loss"] and pos["stop_loss"] > entry:
                     to_close.append((pos, "trailing_stop", current))
                     continue
@@ -2229,7 +2550,6 @@ class CryptoScalper:
                 if trailing_stop < pos["stop_loss"]:
                     pos["stop_loss"] = round(trailing_stop, 6)
                     logger.debug(f"[{pos['id']}] Trail ratcheted stop to {trailing_stop:.6f}")
-                    continue
                 if current > pos["stop_loss"] and pos["stop_loss"] < entry:
                     to_close.append((pos, "trailing_stop", current))
                     continue
@@ -2471,6 +2791,18 @@ class CryptoScalper:
                 exit_stats[reason]["wins"] += 1
             exit_stats[reason]["total_pnl"] += t.get("pnl", 0)
 
+        # --- v3.5: Win rate by macro regime ---
+        macro_regime_stats = {}
+        for t in trades:
+            mr = t.get("macro_regime", "unknown")
+            won = t.get("pnl", 0) > 0
+            if mr not in macro_regime_stats:
+                macro_regime_stats[mr] = {"wins": 0, "total": 0, "total_pnl": 0}
+            macro_regime_stats[mr]["total"] += 1
+            if won:
+                macro_regime_stats[mr]["wins"] += 1
+            macro_regime_stats[mr]["total_pnl"] += t.get("pnl", 0)
+
         # --- Average OB imbalance on wins vs losses ---
         win_obs = [t.get("entry_ob_imbalance", 0) for t in trades if t.get("pnl", 0) > 0]
         loss_obs = [t.get("entry_ob_imbalance", 0) for t in trades if t.get("pnl", 0) <= 0]
@@ -2493,6 +2825,8 @@ class CryptoScalper:
                          for k, v in pair_stats.items()},
             "exit_stats": {k: {**v, "win_rate": v["wins"] / v["total"] if v["total"] > 0 else 0}
                          for k, v in exit_stats.items()},
+            "macro_regime_stats": {k: {**v, "win_rate": v["wins"] / v["total"] if v["total"] > 0 else 0}
+                                  for k, v in macro_regime_stats.items()},
             "avg_ob_imbalance_wins": round(avg_win_ob, 4),
             "avg_ob_imbalance_losses": round(avg_loss_ob, 4),
             "adjustments": [],
@@ -2548,11 +2882,44 @@ class CryptoScalper:
                     tuning["adjustments"].append(
                         f"Removed {pair}: {wr:.0%} win rate over {stats['total']} trades")
 
+        # 6. v3.5: If a macro regime has poor WR over 10+ trades, tighten its profile
+        for mr_name, stats in macro_regime_stats.items():
+            if mr_name == "unknown" or stats["total"] < 10:
+                continue
+            mr_wr = stats["wins"] / stats["total"]
+            # Find the matching regime enum
+            mr_enum = None
+            for r in MacroRegime:
+                if r.value == mr_name:
+                    mr_enum = r
+                    break
+            if mr_enum and mr_enum in self._regime_profiles and mr_wr < 0.30:
+                profile = self._regime_profiles[mr_enum]
+                old_conf = profile.get("min_confluence_score", 5)
+                new_conf = min(old_conf + 1, 9)
+                if new_conf != old_conf:
+                    profile["min_confluence_score"] = new_conf
+                    tuning["adjustments"].append(
+                        f"Macro regime '{mr_name}' WR={mr_wr:.0%} over {stats['total']}t: "
+                        f"raised confluence {old_conf} -> {new_conf}")
+                old_kelly = profile.get("kelly_fraction", 0.10)
+                new_kelly = max(0.03, round(old_kelly - 0.01, 2))
+                if new_kelly != old_kelly:
+                    profile["kelly_fraction"] = new_kelly
+                    tuning["adjustments"].append(
+                        f"Macro regime '{mr_name}': reduced kelly {old_kelly} -> {new_kelly}")
+
         # Log results
         for adj in tuning["adjustments"]:
             logger.info(f"  AUTO-TUNE: {adj}")
         if not tuning["adjustments"]:
             logger.info(f"  AUTO-TUNE: No adjustments needed (WR={overall_wr:.0%})")
+
+        # Log macro regime performance
+        for mr, stats in macro_regime_stats.items():
+            wr = stats["wins"] / stats["total"] if stats["total"] > 0 else 0
+            logger.info(f"  Macro regime {mr}: {wr:.0%} WR ({stats['total']} trades) "
+                        f"PnL: ${stats['total_pnl']:+.4f}")
 
         # Log component performance
         for comp, stats in sorted(component_stats.items(),
@@ -2588,6 +2955,19 @@ class CryptoScalper:
         fg_val = fg["value"] if fg else "?"
         vol_r = self.vol_tracker.btc_vol_ratio
 
+        # v3.5: Adaptive macro regime detection
+        fg_int = fg_val if isinstance(fg_val, int) else 50
+        recent_trades = self.state.closed_trades[-20:]
+        rolling_wr = sum(1 for t in recent_trades if t.get("pnl", 0) > 0) / max(len(recent_trades), 1)
+        macro_regime = self.regime_detector.detect(
+            fear_greed=fg_int,
+            btc_vol_ratio=vol_r,
+            avg_adx=self._last_avg_adx,
+            rolling_wr=rolling_wr,
+            market_breadth=self._last_market_breadth,
+        )
+        self.regime_adapter.apply(macro_regime, self.config)
+
         logger.info(
             f"--- SCAN {datetime.now(timezone.utc).strftime('%H:%M:%S')} | "
             f"${self.state.bankroll:.2f} | "
@@ -2595,7 +2975,8 @@ class CryptoScalper:
             f"PnL: ${self.state.total_pnl:+.2f} | "
             f"W/L: {self.state.winning_trades}/{self.state.total_trades - self.state.winning_trades} | "
             f"Pairs:{len(self.config['pairs'])} | "
-            f"F&G:{fg_val} | BTC-vol:{vol_r:.1f}x ---"
+            f"F&G:{fg_val} | BTC-vol:{vol_r:.1f}x | "
+            f"Regime:{macro_regime.value} ---"
         )
 
         # Update existing positions first
@@ -2611,14 +2992,21 @@ class CryptoScalper:
                 active_pairs = [p for p in scanned if p not in self.state.removed_pairs]
                 self.config["pairs"] = active_pairs
 
+        btc_ticker = self.coinbase.get_ticker("BTC-USD")
+        if btc_ticker and btc_ticker.get("price", 0) > 0:
+            self.vol_tracker.update_btc_price(btc_ticker["price"])
+
         # Scan for new signals with full context
         all_signals = []
+        scan_contexts = []  # v3.5: collect for regime breadth/ADX caching
         for pair in self.config["pairs"]:
             try:
                 # Build full market context (1H trend, order book, funding)
                 ctx = self._build_market_context(pair)
                 if ctx is None:
                     continue  # Skip pair if critical data missing
+                ctx.macro_regime = macro_regime.value
+                scan_contexts.append(ctx)
 
                 # Get 5M candles for entry timing
                 candles_5m = self.coinbase.get_candles(
@@ -2649,6 +3037,13 @@ class CryptoScalper:
 
             time.sleep(0.08)  # HFT: faster inter-pair delay (was 0.15)
 
+        # v3.5: Cache market breadth and avg ADX for next cycle's regime detection
+        if scan_contexts:
+            adx_vals = [c.adx for c in scan_contexts if c.adx > 0]
+            self._last_avg_adx = sum(adx_vals) / len(adx_vals) if adx_vals else 20.0
+            bullish_count = sum(1 for c in scan_contexts if c.hourly_trend == "bullish")
+            self._last_market_breadth = bullish_count / len(scan_contexts)
+
         # Sort by confluence score (highest first), then by grade
         all_signals.sort(
             key=lambda s: (s[0].confluence_score, GRADE_MAP.get(s[0].quality_grade, 0)),
@@ -2675,9 +3070,13 @@ class CryptoScalper:
         drawdown = ((s.peak_bankroll - s.bankroll) / s.peak_bankroll * 100) if s.peak_bankroll > 0 else 0
 
         pair_mode = "dynamic" if self.pair_scanner else "static"
+        regime = self.regime_detector.current_regime.value
         lines = [
             f"{'=' * 65}",
-            f"  CRYPTO SCALPER v3.4 ({pair_mode}: {len(self.config['pairs'])} pairs)",
+            f"  CRYPTO SCALPER v3.5 ({pair_mode}: {len(self.config['pairs'])} pairs)",
+            f"  Macro Regime: {regime} | Confluence>={self.config['min_confluence_score']} "
+            f"TP={self.config['tp_atr_mult']}x SL={self.config['sl_atr_mult']}x "
+            f"Bias={self.config.get('side_bias', 'none')}",
             f"{'=' * 65}",
             f"  Bankroll:   ${s.bankroll:.2f} (started ${s.starting_bankroll:.2f})",
             f"  Total PnL:  ${s.total_pnl:+.2f} ({roi:+.1f}% ROI)",
@@ -2758,7 +3157,7 @@ def setup_logging(verbose: bool = False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Crypto Scalping Bot v3.1")
+    parser = argparse.ArgumentParser(description="Crypto Scalping Bot v3.5")
     parser.add_argument("--bankroll", type=float, default=None)
     parser.add_argument("--scan-once", action="store_true")
     parser.add_argument("--status", action="store_true")
@@ -2768,6 +3167,9 @@ def main():
     parser.add_argument("--min-score", type=int, default=None,
                        help="Min confluence score (default: 4)")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--regime", type=str, default=None,
+                       choices=[r.value for r in MacroRegime],
+                       help="Force a specific macro regime (for testing)")
     args = parser.parse_args()
 
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -2793,10 +3195,18 @@ def main():
         for f in [STATE_FILE, TRADE_LOG]:
             if os.path.exists(f):
                 os.remove(f)
-        print("Scalper v3.4 reset.")
+        print("Scalper v3.5 reset.")
         return
 
     scalper = CryptoScalper(SCALPER_CONFIG)
+
+    # v3.5: Force macro regime override for testing
+    if args.regime:
+        forced = MacroRegime(args.regime)
+        scalper.regime_detector._current = forced
+        scalper.regime_detector._locked_until = 999999  # Lock permanently
+        scalper.regime_adapter.apply(forced, scalper.config)
+        logger.info(f"FORCED REGIME: {forced.value}")
 
     if args.status:
         scalper._check_daily_reset()

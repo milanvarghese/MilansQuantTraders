@@ -21,6 +21,7 @@ import schedule
 
 from config import CONFIG, GAMMA_API_URL, PROXIES
 from opportunity_scanner import MarketAnalyzer, Opportunity
+from risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class PaperTrader:
             self.state.starting_bankroll = bankroll
             self.state.peak_bankroll = bankroll
         self.analyzer = MarketAnalyzer()
+        self.risk_manager = RiskManager()
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -107,6 +109,9 @@ class PaperTrader:
         })
         if PROXIES:
             self.session.proxies.update(PROXIES)
+
+        # Cooldown: market_id -> earliest UTC timestamp we can reopen
+        self._reopen_cooldown: dict[str, float] = {}
 
     def _load_state(self) -> PaperState:
         if os.path.exists(STATE_FILE):
@@ -134,9 +139,10 @@ class PaperTrader:
         os.replace(tmp, STATE_FILE)
 
     def _log_trade(self, action: str, data: dict):
+        write_header = not os.path.exists(TRADE_LOG) or os.path.getsize(TRADE_LOG) == 0
         with open(TRADE_LOG, "a", newline="") as f:
             writer = csv.writer(f)
-            if f.tell() == 0:  # Only write header if file is empty
+            if write_header:
                 writer.writerow([
                     "timestamp", "action", "market_question", "category",
                     "side", "price", "shares", "cost_usd", "pnl",
@@ -164,7 +170,9 @@ class PaperTrader:
         Instead of binary pause, reduce position size as drawdown increases.
         Normal -> Warning -> Critical -> Max -> Pause
         """
-        dd = self.state.peak_bankroll - self.state.bankroll
+        open_exposure = sum(p.get("cost_usd", 0) for p in self.state.positions)
+        current_value = self.state.bankroll + open_exposure
+        dd = self.state.peak_bankroll - current_value
         dd_pct = dd / self.state.peak_bankroll if self.state.peak_bankroll > 0 else 0
 
         if dd_pct < CONFIG.get("drawdown_normal", 0.10):
@@ -241,6 +249,13 @@ class PaperTrader:
             if pos["market_id"] == opp.market_id:
                 logger.info(f"Skip: already have position in this market")
                 return False
+
+        # Reopen cooldown: don't re-enter a market we just exited
+        cooldown_until = self._reopen_cooldown.get(opp.market_id, 0)
+        if time.time() < cooldown_until:
+            mins_left = (cooldown_until - time.time()) / 60
+            logger.info(f"Skip: reopen cooldown ({mins_left:.0f}m remaining) for {opp.market_question[:40]}")
+            return False
 
         # Dynamic Kelly + Drawdown multiplier
         dynamic_kelly = self._get_dynamic_kelly()
@@ -367,12 +382,11 @@ class PaperTrader:
                 to_close.append((pos, "kill_switch", current_price))
                 continue
 
-            # 2. EDGE REVERSAL: market now prices ABOVE our estimate
+            # 2. EDGE REVERSAL: market now prices meaningfully ABOVE our estimate
             #    Our edge has evaporated or reversed — get out
-            #    estimated_prob is already normalized to the side we traded:
-            #    - YES trades: estimated_prob = probability of YES
-            #    - NO trades: estimated_prob = probability of NO (scanner normalizes at line 612)
-            if CONFIG.get("exit_edge_reversal") and current_price > estimated_prob:
+            #    Requires price to exceed estimate by at least 3c to avoid noise-driven loops
+            #    (e.g. estimated_prob=0.85, price=0.86 is noise, price=0.89 is real reversal)
+            if CONFIG.get("exit_edge_reversal") and current_price > estimated_prob + 0.03:
                 to_close.append((pos, "edge_reversal", current_price))
                 continue
 
@@ -393,7 +407,7 @@ class PaperTrader:
                     end_dt = datetime.strptime(pos["end_date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
                     hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
                     exit_hours = CONFIG.get("exit_time_hours", 48)
-                    if 0 < hours_left < exit_hours and current_price < 0.85:
+                    if 0 < hours_left < exit_hours and current_price < 0.85 and current_price <= pos["entry_price"] + 0.05:
                         to_close.append((pos, "time_exit", current_price))
                         continue
                 except (ValueError, TypeError):
@@ -465,6 +479,9 @@ class PaperTrader:
             self.state.closed_trades = self.state.closed_trades[-500:]
         self.state.positions = [p for p in self.state.positions if p["id"] != pos["id"]]
 
+        # Set 2-hour reopen cooldown to prevent open/close loops
+        self._reopen_cooldown[pos["market_id"]] = time.time() + 7200
+
         self._save_state()
         self._log_trade("CLOSE", {
             **pos,
@@ -472,6 +489,8 @@ class PaperTrader:
             "pnl": pnl,
             "actual_outcome": actual_outcome,
         })
+
+        self.risk_manager.record_trade(pnl)
 
         logger.info(
             f"PAPER CLOSE [{pos['id']}]: {pos['side']} {pos['market_question'][:50]} "
@@ -492,6 +511,15 @@ class PaperTrader:
     def scan_and_trade(self):
         """Run a full scan and open positions on good opportunities."""
         self._check_daily_reset()
+
+        allowed, reason = self.risk_manager.can_trade(0)
+        if not allowed:
+            logger.warning(f"RiskManager blocked trading: {reason}")
+            if self.state.positions:
+                self.update_prices()
+                self.check_exits()
+            return
+
         logger.info("=" * 60)
         logger.info(f"PAPER SCAN | {datetime.now(timezone.utc).isoformat()}")
         logger.info(self.get_summary())
@@ -515,7 +543,7 @@ class PaperTrader:
                     continue
                 if self.open_position(opp):
                     opened += 1
-                if opened >= 5:  # Max 5 new positions per scan
+                if opened >= 10:
                     break
 
         self.state.last_scan = datetime.now(timezone.utc).isoformat()

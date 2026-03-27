@@ -10,7 +10,7 @@ CONFIG = {
     "entry_threshold": 0.05,       # Min 5% edge to enter
     "exit_threshold": 0.45,        # Sell when bucket price > 45c
     "max_position_usd": 2.00,      # Max $2 per bucket
-    "max_open_positions": 25,      # Max 25 concurrent (wider market coverage)
+    "max_open_positions": 50,      # Max 50 concurrent — $2 max each, capped by 50% exposure
     "max_exposure_pct": 0.50,      # Max 50% of bankroll at risk
     "daily_loss_limit": -5.00,     # Auto-pause if -$5 on the day
     "kelly_fraction": 0.10,        # Start 10% Kelly — increase via dynamic Kelly after CLV proven
@@ -50,6 +50,10 @@ CONFIG = {
     # --- Retry ---
     "cf_max_retries": 3,           # Cloudflare retry attempts
     "cf_base_delay": 2.0,          # Base delay for exponential backoff (seconds)
+    # --- Sports Analysis ---
+    "sports_min_edge": 0.04,       # Min 4% edge for sports trades (tighter than weather)
+    "sports_min_volume": 5000,     # Min $5k volume for sports markets
+    "sports_min_liquidity": 200,   # Min $200 liquidity
 }
 
 # === City Configurations ===
@@ -92,6 +96,9 @@ PROXIES = {"http": HTTP_PROXY, "https": HTTP_PROXY} if HTTP_PROXY else {}
 # === Telegram Alerts ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# === Sports Odds API ===
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 
 # === Logging ===
 LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "trades.log")

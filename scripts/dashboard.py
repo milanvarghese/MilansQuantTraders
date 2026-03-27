@@ -32,6 +32,11 @@ CRYPTO_STATE = os.path.join(CRYPTO_DIR, "state.json")
 CRYPTO_TRADES = os.path.join(CRYPTO_DIR, "trades.csv")
 CRYPTO_LOG_FILE = os.path.join(CRYPTO_DIR, "scalper.log")
 
+STOCK_DIR = os.path.join(BASE_DIR, "stock_trading")
+STOCK_STATE = os.path.join(STOCK_DIR, "state.json")
+STOCK_TRADES = os.path.join(STOCK_DIR, "trades.csv")
+STOCK_LOG_FILE = os.path.join(STOCK_DIR, "stock_trader.log")
+
 # Auth
 DASH_USER = os.getenv("DASH_USER", "admin")
 DASH_PASS = os.getenv("DASH_PASS", "changeme123")
@@ -109,6 +114,16 @@ def load_crypto_state():
         "positions": [], "closed_trades": [], "total_trades": 0,
         "winning_trades": 0, "total_pnl": 0.0, "daily_pnl": 0.0,
         "daily_trade_count": 0, "last_scan": "", "last_loss_time": 0,
+    })
+
+
+def load_stock_state():
+    return load_json_state(STOCK_STATE, {
+        "bankroll": 1000.0, "starting_bankroll": 1000.0, "peak_bankroll": 1000.0,
+        "positions": [], "closed_trades": [], "total_trades": 0,
+        "winning_trades": 0, "total_pnl": 0.0, "daily_pnl": 0.0,
+        "daily_trade_count": 0, "last_scan": "", "last_loss_time": 0,
+        "regime": "bull",
     })
 
 
@@ -259,15 +274,23 @@ window.addEventListener('beforeunload', function() {
       <span class="n" style="font-size:0.6em">({{ poly.total_trades }} trades)</span></div>
   </div>
   <div>
+    <div class="sub">Stocks</div>
+    <div class="val {{ 'g' if stock.total_pnl >= 0 else 'r' }}">${{ "%+.2f"|format(stock.total_pnl) }}
+      <span class="n" style="font-size:0.6em">({{ stock.total_trades }} trades)</span></div>
+  </div>
+  <div>
     <div class="sub">Total Bankroll</div>
-    <div class="val b">${{ "%.2f"|format(crypto.bankroll + crypto_exposure + poly.bankroll + poly_exposure) }}</div>
+    <div class="val b">${{ "%.2f"|format(crypto.bankroll + crypto_exposure + poly.bankroll + poly_exposure + stock.bankroll + stock_exposure) }}</div>
   </div>
 </div>
 </div>
 
 <!-- Tabs -->
 <div class="tabs">
-  <div class="tab active" onclick="switchTab('crypto', this)">
+  <div class="tab active" onclick="switchTab('stock', this)">
+    Stocks <span class="badge-count">{{ stock_positions|length }} open</span>
+  </div>
+  <div class="tab" onclick="switchTab('crypto', this)">
     Crypto Scalper <span class="badge-count">{{ crypto_positions|length }} open</span>
   </div>
   <div class="tab" onclick="switchTab('poly', this)">
@@ -276,7 +299,7 @@ window.addEventListener('beforeunload', function() {
 </div>
 
 <!-- ===================== CRYPTO TAB ===================== -->
-<div id="tab-crypto" class="tab-content active">
+<div id="tab-crypto" class="tab-content">
 <div class="container">
 
 <!-- Scalper Model Card -->
@@ -420,12 +443,12 @@ window.addEventListener('beforeunload', function() {
       <div style="display:flex;justify-content:space-between;align-items:center;">
         <h3 id="priceChartTitle">Select a pair</h3>
         <div style="display:flex;gap:6px;">
-          <button class="tf-btn" onclick="changeTimeframe('FIVE_MINUTE',288)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">24H</button>
-          <button class="tf-btn" onclick="changeTimeframe('ONE_HOUR',168)" style="padding:3px 10px;border:1px solid #21262d;background:#0d2744;color:#58a6ff;border-radius:4px;cursor:pointer;font-size:0.65em;">7D</button>
-          <button class="tf-btn" onclick="changeTimeframe('SIX_HOUR',120)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">1M</button>
-          <button class="tf-btn" onclick="changeTimeframe('ONE_DAY',90)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">3M</button>
-          <button class="tf-btn" onclick="changeTimeframe('ONE_DAY',365)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">1Y</button>
-          <button class="tf-btn" onclick="changeTimeframe('ONE_DAY',3000)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">ALL</button>
+          <button class="tf-btn" onclick="changeTimeframe(event,'FIVE_MINUTE',288)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">24H</button>
+          <button class="tf-btn" onclick="changeTimeframe(event,'ONE_HOUR',168)" style="padding:3px 10px;border:1px solid #21262d;background:#0d2744;color:#58a6ff;border-radius:4px;cursor:pointer;font-size:0.65em;">7D</button>
+          <button class="tf-btn" onclick="changeTimeframe(event,'SIX_HOUR',120)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">1M</button>
+          <button class="tf-btn" onclick="changeTimeframe(event,'ONE_DAY',90)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">3M</button>
+          <button class="tf-btn" onclick="changeTimeframe(event,'ONE_DAY',365)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">1Y</button>
+          <button class="tf-btn" onclick="changeTimeframe(event,'ONE_DAY',3000)" style="padding:3px 10px;border:1px solid #21262d;background:#161b22;color:#8b949e;border-radius:4px;cursor:pointer;font-size:0.65em;">ALL</button>
         </div>
       </div>
       <div style="position:relative;height:350px;"><canvas id="priceChart"></canvas></div>
@@ -687,14 +710,211 @@ window.addEventListener('beforeunload', function() {
 </div>
 </div>
 
+<!-- ===================== STOCKS TAB ===================== -->
+<div id="tab-stock" class="tab-content active">
+<div class="container">
+
+<!-- Stock Model Card -->
+<div class="model-card">
+  <div>
+    <div class="mc-label">Engine</div>
+    <div class="mc-val">12-Signal Confluence</div>
+  </div>
+  <div>
+    <div class="mc-label">Min Score</div>
+    <div class="mc-val">5</div>
+  </div>
+  <div>
+    <div class="mc-label">Regime</div>
+    <div class="mc-val b">{{ stock.get('regime', 'unknown')|upper }}</div>
+  </div>
+  <div>
+    <div class="mc-label">Avg Score</div>
+    <div class="mc-val b">{{ "%.1f"|format(stock_avg_score) }}</div>
+  </div>
+  <div>
+    <div class="mc-label">WR by Grade</div>
+    <div class="mc-val">{% for g, s in stock_grade_wr.items() %}<span class="{{ 'g' if s >= 50 else 'r' }}">{{g}}:{{s|int}}%</span> {% endfor %}</div>
+  </div>
+  <div>
+    <div class="mc-label">Market</div>
+    <div class="mc-val {{ 'g' if stock_market_open else 'r' }}">{{ 'OPEN' if stock_market_open else 'CLOSED' }}</div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat">
+    <div class="label">Bankroll</div>
+    <div class="val {{ 'g' if (stock.bankroll + stock_exposure) >= stock.starting_bankroll else 'r' }}">${{ "%.2f"|format(stock.bankroll + stock_exposure) }}</div>
+    <div class="n" style="font-size:0.6em">${{ "%.2f"|format(stock.bankroll) }} cash + ${{ "%.2f"|format(stock_exposure) }} in positions</div>
+  </div>
+  <div class="stat">
+    <div class="label">Total P&L</div>
+    <div class="val {{ 'g' if stock.total_pnl >= 0 else 'r' }}">${{ "%+.2f"|format(stock.total_pnl) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Daily P&L</div>
+    <div class="val {{ 'g' if stock.daily_pnl >= 0 else 'r' }}">${{ "%+.2f"|format(stock.daily_pnl) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Win Rate</div>
+    <div class="val {{ 'g' if stock_wr >= 50 else 'y' if stock_wr >= 40 else 'r' }}">{{ "%.0f"|format(stock_wr) }}%</div>
+  </div>
+  <div class="stat">
+    <div class="label">Trades</div>
+    <div class="val n">{{ stock.total_trades }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Open</div>
+    <div class="val n">{{ stock_positions|length }} / ${{ "%.2f"|format(stock_exposure) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Avg P&L/Trade</div>
+    <div class="val {{ 'g' if stock_avg >= 0 else 'r' }}">${{ "%+.4f"|format(stock_avg) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">ROI</div>
+    <div class="val {{ 'g' if stock_roi >= 0 else 'r' }}">{{ "%+.1f"|format(stock_roi) }}%</div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat">
+    <div class="label">Profit Factor</div>
+    <div class="val {{ 'g' if stock_analytics.profit_factor >= 1 else 'r' }}">{{ "%.2f"|format(stock_analytics.profit_factor) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Sharpe</div>
+    <div class="val {{ 'g' if stock_analytics.sharpe >= 0 else 'r' }}">{{ "%.2f"|format(stock_analytics.sharpe) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Max Drawdown</div>
+    <div class="val r">${{ "%.2f"|format(stock_analytics.max_dd) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Best Trade</div>
+    <div class="val g">${{ "%+.2f"|format(stock_analytics.best_trade) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Worst Trade</div>
+    <div class="val r">${{ "%+.2f"|format(stock_analytics.worst_trade) }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Avg Win / Loss</div>
+    <div class="val"><span class="g">${{ "%.2f"|format(stock_analytics.avg_win) }}</span> / <span class="r">${{ "%.2f"|format(stock_analytics.avg_loss) }}</span></div>
+  </div>
+  <div class="stat">
+    <div class="label">Streak</div>
+    <div class="val {{ 'g' if stock_analytics.streak > 0 else 'r' if stock_analytics.streak < 0 else 'n' }}">{{ stock_analytics.streak }}{{ stock_analytics.streak_type }}</div>
+  </div>
+</div>
+
+<!-- Stock Charts -->
+<div class="charts">
+  <div class="chart-card">
+    <h3>Stock P&L Over Time</h3>
+    <div class="chart-wrap"><canvas id="stockPnlChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Sector Allocation</h3>
+    <div class="chart-wrap"><canvas id="stockSectorChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Daily P&L</h3>
+    <div class="chart-wrap"><canvas id="stockDailyChart"></canvas></div>
+  </div>
+</div>
+<div class="charts" style="grid-template-columns: 1fr 1fr 1fr;">
+  <div class="chart-card">
+    <h3>Win Rate by Grade</h3>
+    <div class="chart-wrap"><canvas id="stockGradeChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>P&L by Regime</h3>
+    <div class="chart-wrap"><canvas id="stockRegimeChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Confluence Score Distribution</h3>
+    <div class="chart-wrap"><canvas id="stockScoreChart"></canvas></div>
+  </div>
+</div>
+
+<!-- Stock Open Positions -->
+{% if stock_positions %}
+<div class="section">
+  <h2>Open Positions ({{ stock_positions|length }})</h2>
+  <table>
+    <tr><th>ID</th><th>Symbol</th><th>Sector</th><th>Entry</th><th>Current</th><th>%</th><th>P&L</th><th>Size</th><th>Score</th><th>Grade</th><th>Regime</th><th>TP</th><th>SL</th><th>Opened</th></tr>
+    {% for p in stock_positions %}
+    {% set pct = ((p.current_price - p.entry_price) / p.entry_price * 100) if p.entry_price > 0 else 0 %}
+    <tr>
+      <td>{{ p.id }}</td>
+      <td><strong>{{ p.symbol }}</strong></td>
+      <td>{{ p.get('sector', '?') }}</td>
+      <td>${{ "%.2f"|format(p.entry_price) }}</td>
+      <td>${{ "%.2f"|format(p.get('current_price', p.entry_price)) }}</td>
+      <td class="{{ 'g' if pct >= 0 else 'r' }}">{{ "%+.2f"|format(pct) }}%</td>
+      <td class="{{ 'g' if p.get('unrealized_pnl', 0) >= 0 else 'r' }}">${{ "%+.4f"|format(p.get('unrealized_pnl', 0)) }}</td>
+      <td>${{ "%.2f"|format(p.cost_usd) }}</td>
+      <td class="b">{{ p.get('confluence_score', '?') }}</td>
+      <td><span class="badge badge-{{ 'high' if p.get('quality_grade','') in ('A','B') else 'medium' if p.get('quality_grade','')=='C' else 'low' }}">{{ p.get('quality_grade', '?') }}</span></td>
+      <td>{{ p.get('regime', '?') }}</td>
+      <td class="g">${{ "%.2f"|format(p.take_profit) }}</td>
+      <td class="r">${{ "%.2f"|format(p.stop_loss) }}</td>
+      <td>{{ p.opened_at[:16] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<!-- Stock Closed Trades -->
+{% if stock_closed %}
+<div class="section">
+  <h2>Closed Trades (Last 50 of {{ stock_closed|length }})</h2>
+  <table>
+    <tr><th>ID</th><th>Symbol</th><th>Sector</th><th>Entry</th><th>Exit</th><th>P&L</th><th>%</th><th>Score</th><th>Grade</th><th>Regime</th><th>Reason</th><th>Closed</th></tr>
+    {% for t in stock_closed[-50:]|reverse %}
+    {% set pct = ((t.get('close_price', t.entry_price) - t.entry_price) / t.entry_price * 100) if t.entry_price > 0 else 0 %}
+    <tr>
+      <td>{{ t.id }}</td>
+      <td><strong>{{ t.symbol }}</strong></td>
+      <td>{{ t.get('sector', '?') }}</td>
+      <td>${{ "%.2f"|format(t.entry_price) }}</td>
+      <td>${{ "%.2f"|format(t.get('close_price', t.entry_price)) }}</td>
+      <td class="{{ 'g' if t.pnl >= 0 else 'r' }}">${{ "%+.4f"|format(t.pnl) }}</td>
+      <td class="{{ 'g' if pct >= 0 else 'r' }}">{{ "%+.2f"|format(pct) }}%</td>
+      <td class="b">{{ t.get('confluence_score', '?') }}</td>
+      <td><span class="badge badge-{{ 'high' if t.get('quality_grade','') in ('A','B') else 'medium' if t.get('quality_grade','')=='C' else 'low' }}">{{ t.get('quality_grade', '?') }}</span></td>
+      <td>{{ t.get('regime', '?') }}</td>
+      <td>{{ t.get('close_reason', '?') }}</td>
+      <td>{{ t.get('closed_at', '')[:16] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<!-- Stock Log -->
+<div class="section">
+  <h2>Stock Trader Log (Last 50)</h2>
+  <div class="log-box">{% if stock_logs %}{% for line in stock_logs %}{{ line }}{% endfor %}{% else %}No log entries yet{% endif %}</div>
+</div>
+
+</div>
+</div>
+
 <script>
 // Tab switching with persistence
 function switchTab(tab, el) {
   document.querySelectorAll('.tab-content').forEach(e => e.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(e => e.classList.remove('active'));
   document.getElementById('tab-' + tab).classList.add('active');
-  if (el) el.closest('.tab').classList.add('active');
-  else { document.querySelectorAll('.tab')[tab === 'crypto' ? 0 : 1].classList.add('active'); }
+  if (el) el.classList.add('active');
+  else {
+    const tabIdx = {stock: 0, crypto: 1, poly: 2}[tab] || 0;
+    document.querySelectorAll('.tab')[tabIdx].classList.add('active');
+  }
   localStorage.setItem('ds_tab', 'tab-' + tab);
 }
 
@@ -947,6 +1167,126 @@ if (Object.keys(polyConfPnl).length > 0) {
   });
 }
 
+// --- Stock Charts ---
+const stockPnl = {{ stock_pnl_timeline | tojson | replace("</", "<\\/") }};
+if (stockPnl.length > 0) {
+  new Chart(document.getElementById('stockPnlChart'), {
+    type: 'line',
+    data: {
+      labels: stockPnl.map(d => d.time),
+      datasets: [{
+        data: stockPnl.map(d => d.pnl),
+        borderColor: stockPnl[stockPnl.length-1].pnl >= 0 ? '#3fb950' : '#f85149',
+        backgroundColor: stockPnl[stockPnl.length-1].pnl >= 0 ? 'rgba(63,185,80,0.1)' : 'rgba(248,81,73,0.1)',
+        fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2,
+      }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { display: false },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
+      }
+    }
+  });
+}
+
+// Stock sector allocation pie
+const stockSectors = {{ stock_sector_counts | tojson | replace("</", "<\\/") }};
+if (Object.keys(stockSectors).length > 0) {
+  new Chart(document.getElementById('stockSectorChart'), {
+    type: 'doughnut',
+    data: {
+      labels: Object.keys(stockSectors),
+      datasets: [{ data: Object.values(stockSectors), backgroundColor: chartColors, borderWidth: 0 }]
+    },
+    options: { ...chartDefaults, plugins: { legend: { display: true, position: 'right', labels: { color: '#8b949e', font: { size: 10 }, padding: 6 } } } }
+  });
+}
+
+// Stock daily P&L bars
+const stockDaily = {{ stock_daily | tojson | replace("</", "<\\/") }};
+if (stockDaily.length > 0) {
+  new Chart(document.getElementById('stockDailyChart'), {
+    type: 'bar',
+    data: {
+      labels: stockDaily.map(d => d.day.slice(5)),
+      datasets: [{
+        data: stockDaily.map(d => d.pnl),
+        backgroundColor: stockDaily.map(d => d.pnl >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)'),
+        borderWidth: 0,
+      }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 9 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
+      }
+    }
+  });
+}
+
+// Stock grade win rate chart
+const stockGradeWr = {{ stock_grade_wr_full | tojson | replace("</", "<\\/") }};
+if (Object.keys(stockGradeWr).length > 0) {
+  const sGradeLabels = Object.keys(stockGradeWr);
+  new Chart(document.getElementById('stockGradeChart'), {
+    type: 'bar',
+    data: {
+      labels: sGradeLabels,
+      datasets: [{ label: 'Win Rate %', data: sGradeLabels.map(g => stockGradeWr[g].wr), backgroundColor: sGradeLabels.map(g => stockGradeWr[g].wr >= 50 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)'), borderWidth: 0 }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e' } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => v + '%' }, max: 100 }
+      },
+      plugins: { legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ctx.parsed.y.toFixed(0) + '% (' + sGradeLabels.map(g => stockGradeWr[g].n)[ctx.dataIndex] + ' trades)' } }
+      }
+    }
+  });
+}
+
+// Stock P&L by regime chart
+const stockRegimePnl = {{ stock_regime_pnl | tojson | replace("</", "<\\/") }};
+if (Object.keys(stockRegimePnl).length > 0) {
+  const sRegLabels = Object.keys(stockRegimePnl);
+  new Chart(document.getElementById('stockRegimeChart'), {
+    type: 'bar',
+    data: {
+      labels: sRegLabels,
+      datasets: [{ data: Object.values(stockRegimePnl), backgroundColor: sRegLabels.map(r => stockRegimePnl[r] >= 0 ? 'rgba(63,185,80,0.7)' : 'rgba(248,81,73,0.7)'), borderWidth: 0 }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 9 } } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
+      }
+    }
+  });
+}
+
+// Stock confluence score distribution
+const stockScores = {{ stock_score_data | tojson | replace("</", "<\\/") }};
+if (stockScores.length > 0) {
+  const sScoreBins = {};
+  stockScores.forEach(s => { sScoreBins[s] = (sScoreBins[s] || 0) + 1; });
+  const sSLabels = Object.keys(sScoreBins).sort((a,b) => a-b);
+  new Chart(document.getElementById('stockScoreChart'), {
+    type: 'bar',
+    data: {
+      labels: sSLabels.map(s => s + '/12'),
+      datasets: [{ data: sSLabels.map(s => sScoreBins[s]), backgroundColor: 'rgba(88,166,255,0.6)', borderColor: '#58a6ff', borderWidth: 1 }]
+    },
+    options: { ...chartDefaults,
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e' } },
+        y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', stepSize: 1 } }
+      }
+    }
+  });
+}
+
 // --- Price Charts ---
 let priceChart = null;
 let currentPair = '';
@@ -972,7 +1312,7 @@ function loadChart(pair) {
     });
 }
 
-function changeTimeframe(gran, limit) {
+function changeTimeframe(event, gran, limit) {
   currentGranularity = gran;
   currentLimit = limit;
   localStorage.setItem('ds_gran', gran);
@@ -1069,8 +1409,9 @@ function renderPriceChart(candles, pair) {
   if (savedGran) { currentGranularity = savedGran; currentLimit = parseInt(savedLimit) || 168; }
 
   const savedTab = localStorage.getItem('ds_tab');
-  if (savedTab && savedTab !== 'tab-crypto') {
-    switchTab(savedTab.replace('tab-', ''));
+  if (savedTab && savedTab !== 'tab-stock') {
+    const tabName = savedTab.replace('tab-', '');
+    if (['crypto', 'poly', 'stock'].includes(tabName)) switchTab(tabName);
   }
 
   {% if crypto_pairs %}
@@ -1112,14 +1453,17 @@ def fmt_price(p):
 @app.route("/")
 @auth_required
 def index():
-    # Load both states
+    # Load all states
     poly_state = load_paper_state()
     crypto_state = load_crypto_state()
+    stock_state = load_stock_state()
 
     poly_positions = poly_state.get("positions", [])
     poly_closed = poly_state.get("closed_trades", [])
     crypto_positions = crypto_state.get("positions", [])
     crypto_closed = crypto_state.get("closed_trades", [])
+    stock_positions = stock_state.get("positions", [])
+    stock_closed = stock_state.get("closed_trades", [])
 
     # Poly stats
     poly_total = poly_state.get("total_trades", 0)
@@ -1136,7 +1480,15 @@ def index():
     crypto_roi = ((crypto_state.get("total_pnl", 0) / crypto_starting) * 100) if crypto_starting > 0 else 0
     crypto_avg = (crypto_state.get("total_pnl", 0) / crypto_total) if crypto_total > 0 else 0
 
-    combined_pnl = poly_state.get("total_pnl", 0) + crypto_state.get("total_pnl", 0)
+    # Stock stats
+    stock_total = stock_state.get("total_trades", 0)
+    stock_wr = (sum(1 for t in stock_closed if float(t.get("pnl", 0)) > 0) / len(stock_closed) * 100) if stock_closed else 0
+    stock_exposure = sum(p.get("cost_usd", 0) for p in stock_positions)
+    stock_starting = stock_state.get("starting_bankroll", 1000.0)
+    stock_roi = ((stock_state.get("total_pnl", 0) / stock_starting) * 100) if stock_starting > 0 else 0
+    stock_avg = (stock_state.get("total_pnl", 0) / stock_total) if stock_total > 0 else 0
+
+    combined_pnl = poly_state.get("total_pnl", 0) + crypto_state.get("total_pnl", 0) + stock_state.get("total_pnl", 0)
 
     # Advanced analytics
     def calc_analytics(closed_trades):
@@ -1208,6 +1560,7 @@ def index():
 
     crypto_analytics = calc_analytics(crypto_closed)
     poly_analytics = calc_analytics(poly_closed)
+    stock_analytics = calc_analytics(stock_closed)
 
     # Daily P&L bars
     def daily_pnl_bars(closed_trades):
@@ -1309,9 +1662,68 @@ def index():
                 [float(p.get("edge_at_entry", 0)) for p in poly_positions]
     poly_avg_edge = sum(all_edges) / len(all_edges) if all_edges else 0
 
+    # Stock analytics
+    stock_daily = daily_pnl_bars(stock_closed)
+    stock_pnl_timeline = compute_pnl_from_csv(STOCK_TRADES) or compute_pnl_timeline(stock_closed)
+
+    # Stock sector counts (from open positions)
+    stock_sector_counts = defaultdict(int)
+    for p in stock_positions:
+        sector = p.get("sector", "unknown")
+        stock_sector_counts[sector] += 1
+    # Also count from closed trades if no open positions
+    if not stock_positions:
+        for t in stock_closed[-20:]:
+            sector = t.get("sector", "unknown")
+            stock_sector_counts[sector] += 1
+
+    # Stock grade win rate
+    stock_grade_stats = defaultdict(lambda: {"wins": 0, "total": 0})
+    for t in stock_closed:
+        grade = t.get("quality_grade", "?")
+        stock_grade_stats[grade]["total"] += 1
+        if float(t.get("pnl", 0)) > 0:
+            stock_grade_stats[grade]["wins"] += 1
+    stock_grade_wr = {}
+    stock_grade_wr_full = {}
+    for g in sorted(stock_grade_stats.keys()):
+        s = stock_grade_stats[g]
+        wr = (s["wins"] / s["total"] * 100) if s["total"] > 0 else 0
+        stock_grade_wr[g] = round(wr, 0)
+        stock_grade_wr_full[g] = {"wr": round(wr, 1), "n": s["total"]}
+
+    # Stock P&L by regime
+    stock_regime_pnl_data = defaultdict(float)
+    for t in stock_closed:
+        regime = t.get("regime", "unknown")
+        stock_regime_pnl_data[regime] += float(t.get("pnl", 0))
+    stock_regime_pnl = {k: round(v, 4) for k, v in stock_regime_pnl_data.items()}
+
+    # Stock avg confluence score
+    stock_scores = [int(t.get("confluence_score", 0)) for t in stock_closed if t.get("confluence_score")]
+    stock_avg_score = sum(stock_scores) / len(stock_scores) if stock_scores else 0
+    stock_score_data = stock_scores
+
+    # Stock market open status
+    stock_market_open = False
+    try:
+        import requests as _req
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+        base_url = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        if api_key and secret_key:
+            resp = _req.get(f"{base_url}/v2/clock",
+                           headers={"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key},
+                           timeout=5)
+            if resp.status_code == 200:
+                stock_market_open = resp.json().get("is_open", False)
+    except Exception:
+        pass
+
     # Logs
     crypto_logs = load_recent_logs(CRYPTO_LOG_FILE)
     poly_logs = load_recent_logs(PAPER_LOG_FILE)
+    stock_logs = load_recent_logs(STOCK_LOG_FILE)
 
     # Get active crypto pairs from state or default
     crypto_pairs = [
@@ -1361,6 +1773,25 @@ def index():
         poly_logs=poly_logs,
         poly_analytics=poly_analytics,
         poly_daily=poly_daily,
+        # Stocks
+        stock=stock_state,
+        stock_positions=stock_positions,
+        stock_closed=stock_closed,
+        stock_wr=stock_wr,
+        stock_exposure=stock_exposure,
+        stock_roi=stock_roi,
+        stock_avg=stock_avg,
+        stock_pnl_timeline=stock_pnl_timeline,
+        stock_analytics=stock_analytics,
+        stock_daily=stock_daily,
+        stock_sector_counts=dict(stock_sector_counts),
+        stock_grade_wr=stock_grade_wr,
+        stock_grade_wr_full=stock_grade_wr_full,
+        stock_regime_pnl=stock_regime_pnl,
+        stock_avg_score=stock_avg_score,
+        stock_score_data=stock_score_data,
+        stock_market_open=stock_market_open,
+        stock_logs=stock_logs,
         # Helper
         fmt_price=fmt_price,
         # Price charts
@@ -1374,6 +1805,7 @@ def api_status():
     return jsonify({
         "crypto": load_crypto_state(),
         "polymarket": load_paper_state(),
+        "stocks": load_stock_state(),
     })
 
 
