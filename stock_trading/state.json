@@ -1,7 +1,7 @@
 {
-  "bankroll": 50.0,
-  "starting_bankroll": 50.0,
-  "peak_bankroll": 50.0,
+  "bankroll": 1000.00,
+  "starting_bankroll": 1000.00,
+  "peak_bankroll": 1000.00,
   "positions": [],
   "closed_trades": [],
   "total_trades": 0,
@@ -11,8 +11,10 @@
   "daily_trade_count": 0,
   "last_loss_time": 0.0,
   "consecutive_losses": 0,
-  "last_reset_date": "2026-03-27",
+  "last_reset_date": "",
   "last_scan": "",
-  "removed_pairs": [],
-  "tuned_overrides": {}
+  "removed_symbols": [],
+  "tuned_overrides": {},
+  "regime": "bull",
+  "bandit_state": {}
 }

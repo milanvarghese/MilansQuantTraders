@@ -351,9 +351,9 @@ REGIME_PARAMS = {
         "description": "SPY < 200 EMA",
     },
     MarketRegime.HIGH_VOL: {
-        "min_confluence": 6,
-        "max_positions": 3,
-        "position_scale": 0.5,
+        "min_confluence": 7,
+        "max_positions": 2,
+        "position_scale": 0.3,
         "description": "VIX > 30",
     },
     MarketRegime.CHOPPY: {
@@ -374,6 +374,7 @@ class RegimeDetector:
         self._pending = None
         self._pending_count = 0
         self._confirmation_needed = config.get("regime_confirmation_scans", 3)
+        self._first_update = True
 
     @property
     def current(self) -> MarketRegime:
@@ -402,6 +403,14 @@ class RegimeDetector:
             raw = MarketRegime.CAUTIOUS
         else:
             raw = MarketRegime.BULL
+
+        # On first update, set regime immediately (no anti-whipsaw delay)
+        if self._first_update:
+            self._first_update = False
+            if raw != self._current:
+                logger.info(f"REGIME INIT: {self._current.value} -> {raw.value}")
+                self._current = raw
+            return self._current
 
         # Anti-whipsaw: require N confirmations
         if raw != self._current:
@@ -558,7 +567,6 @@ class AlpacaClient:
         """Make API request with rate limiting and error handling."""
         try:
             resp = self.session.request(method, url, timeout=15, **kwargs)
-            # Track rate limits
             self._rate_limit_remaining = int(resp.headers.get("x-ratelimit-remaining", 200))
             if self._rate_limit_remaining < 10:
                 logger.warning(f"Rate limit low: {self._rate_limit_remaining} remaining")
@@ -568,10 +576,13 @@ class AlpacaClient:
                 logger.warning(f"Rate limited, waiting {wait}s")
                 time.sleep(wait)
                 resp = self.session.request(method, url, timeout=15, **kwargs)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                body = resp.text[:500]
+                logger.error(f"Alpaca API {method} {url.split('/')[-1]} → {resp.status_code}: {body}")
+                return None
             return resp.json()
         except requests.exceptions.RequestException as e:
-            logger.debug(f"API error: {e}")
+            logger.error(f"Alpaca API request failed: {e}")
             return None
 
     def get_account(self) -> Optional[dict]:
@@ -654,15 +665,19 @@ class AlpacaClient:
         return self._request("GET", f"{self.base_url}/v2/positions")
 
     def place_order(self, symbol: str, qty: float, side: str,
-                    order_type: str = "market", time_in_force: str = "day") -> Optional[dict]:
-        """Place an order."""
+                    order_type: str = "market", time_in_force: str = "day",
+                    notional: float = None) -> Optional[dict]:
+        """Place an order. Use notional (dollar amount) for fractional shares."""
         payload = {
             "symbol": symbol,
-            "qty": str(qty),
             "side": side,
             "type": order_type,
             "time_in_force": time_in_force,
         }
+        if notional is not None:
+            payload["notional"] = str(round(notional, 2))
+        else:
+            payload["qty"] = str(round(qty, 2))
         return self._request("POST", f"{self.base_url}/v2/orders", json=payload)
 
     def close_position(self, symbol: str) -> Optional[dict]:
@@ -1450,8 +1465,9 @@ class StockTrader:
         try:
             order = self.alpaca.place_order(
                 symbol=signal.symbol,
-                qty=round(shares, 6),
+                qty=0,
                 side="buy",
+                notional=position_size,
             )
             if order is None:
                 raise RuntimeError(f"Alpaca order returned None for {signal.symbol}")
