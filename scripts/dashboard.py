@@ -941,9 +941,12 @@ if (cryptoPnl.length > 0) {
     },
     options: { ...chartDefaults,
       scales: {
-        x: { display: false },
+        x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0, font: { size: 9 },
+          callback: function(val, i) { const t = cryptoPnl[i]?.time || ''; return t.slice(5,10); } } ,
+          grid: { display: false } },
         y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(4) } }
-      }
+      },
+      plugins: { ...chartDefaults.plugins, tooltip: { callbacks: { title: function(ctx) { return cryptoPnl[ctx[0].dataIndex]?.time || ''; } } } }
     }
   });
 }
@@ -1063,9 +1066,12 @@ if (polyPnl.length > 0) {
     },
     options: { ...chartDefaults,
       scales: {
-        x: { display: false },
+        x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0, font: { size: 9 },
+          callback: function(val, i) { const t = polyPnl[i]?.time || ''; return t.slice(5,10); } },
+          grid: { display: false } },
         y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
-      }
+      },
+      plugins: { ...chartDefaults.plugins, tooltip: { callbacks: { title: function(ctx) { return polyPnl[ctx[0].dataIndex]?.time || ''; } } } }
     }
   });
 }
@@ -1183,9 +1189,12 @@ if (stockPnl.length > 0) {
     },
     options: { ...chartDefaults,
       scales: {
-        x: { display: false },
+        x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0, font: { size: 9 },
+          callback: function(val, i) { const t = stockPnl[i]?.time || ''; return t.slice(5,10); } },
+          grid: { display: false } },
         y: { grid: { color: '#21262d' }, ticks: { color: '#8b949e', callback: v => '$' + v.toFixed(2) } }
-      }
+      },
+      plugins: { ...chartDefaults.plugins, tooltip: { callbacks: { title: function(ctx) { return stockPnl[ctx[0].dataIndex]?.time || ''; } } } }
     }
   });
 }

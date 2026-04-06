@@ -115,7 +115,7 @@ UNIVERSE = {
         "COST", "WMT",
     ],
     "growth_tech": [
-        "AMD", "CRM", "NFLX", "ADBE", "ORCL", "INTC", "QCOM", "MU",
+        "AMD", "NFLX", "ADBE", "INTC", "QCOM", "MU",
         "AMAT", "PANW", "SHOP", "SQ", "COIN", "PLTR", "SNOW",
     ],
     "sector_leaders": [
@@ -126,9 +126,33 @@ UNIVERSE = {
         "SMCI", "MSTR", "RIVN", "LCID", "SOFI", "HOOD", "RBLX", "SNAP",
         "ROKU", "UPST",
     ],
+    "financials": [
+        "BX", "SCHW", "C", "BAC", "WFC", "AXP", "ICE", "CME", "SPGI", "MCO",
+    ],
+    "healthcare_biotech": [
+        "TMO", "ISRG", "VRTX", "REGN", "GILD", "AMGN", "BMY", "ZTS", "SYK", "MDT",
+    ],
+    "industrials": [
+        "HON", "RTX", "UNP", "FDX", "UPS", "WM", "ETN", "ITW", "EMR", "CSX",
+    ],
+    "consumer_retail": [
+        "MCD", "LOW", "TJX", "TGT", "ORLY", "AZO", "ROST", "DG", "YUM", "CMG",
+    ],
+    "semiconductors": [
+        "MRVL", "KLAC", "LRCX", "ASML", "ADI", "NXPI", "ON", "MCHP", "TXN", "SNPS",
+    ],
+    "software_cloud": [
+        "CRM", "ORCL", "NOW", "WDAY", "DDOG", "NET", "CRWD", "ZS", "TEAM", "FTNT",
+    ],
+    "energy_materials": [
+        "SLB", "EOG", "OXY", "FCX", "NEM", "LIN", "APD", "ECL", "DD", "DOW",
+    ],
+    "media_comm": [
+        "CMCSA", "T", "VZ", "CHTR", "TMUS", "ABNB", "BKNG", "UBER", "LYFT", "DASH",
+    ],
     "etfs": [
-        "SPY", "QQQ", "IWM", "XLF", "XLE", "XLK", "XLV", "GLD", "TLT",
-        "UVXY",
+        "SPY", "QQQ", "IWM", "XLF", "XLE", "XLK", "XLV", "XLI", "XLC",
+        "XLY", "XLP", "SMH", "GLD", "TLT", "UVXY",
     ],
 }
 
@@ -139,7 +163,16 @@ SECTOR_ETF_MAP = {
     "growth_tech": "XLK",
     "sector_leaders": "SPY",
     "high_beta": "QQQ",
-    "etfs": None,  # ETFs don't need sector check
+    "financials": "XLF",
+    "healthcare_biotech": "XLV",
+    "industrials": "XLI",
+    "consumer_retail": "XLY",
+    "semiconductors": "SMH",
+    "software_cloud": "XLK",
+    "energy_materials": "XLE",
+    "media_comm": "XLC",
+    "etfs": None,
+    "dynamic": "SPY",
 }
 for sector, symbols in UNIVERSE.items():
     for sym in symbols:
@@ -148,6 +181,7 @@ for sector, symbols in UNIVERSE.items():
 ALL_SYMBOLS = []
 for symbols in UNIVERSE.values():
     ALL_SYMBOLS.extend(symbols)
+ALL_SYMBOLS_SET = set(ALL_SYMBOLS)
 
 
 # --- Technical Analysis Functions ---
@@ -685,6 +719,67 @@ class AlpacaClient:
         return self._request("DELETE", f"{self.base_url}/v2/positions/{symbol}")
 
 
+# --- Dynamic Stock Screener ---
+
+class DynamicScreener:
+    """Discovers tradeable stocks outside the static universe using Alpaca screener APIs."""
+
+    def __init__(self, alpaca: 'AlpacaClient', config: dict):
+        self.alpaca = alpaca
+        self.config = config
+        self._cache = {"symbols": [], "ts": 0}
+        self._cache_ttl = 900  # 15 minutes
+
+    def screen(self) -> list[str]:
+        """Return dynamic symbols to add to scan. Cached 15 min."""
+        if time.time() - self._cache["ts"] < self._cache_ttl:
+            return self._cache["symbols"]
+
+        candidates = set()
+
+        # 1. Most active by volume (1 API call)
+        actives = self.alpaca._request(
+            "GET", f"{self.alpaca.data_url}/v1beta1/screener/stocks/most-actives",
+            params={"by": "volume", "top": 50},
+        )
+        if actives and "most_actives" in actives:
+            for item in actives["most_actives"]:
+                sym = item.get("symbol", "")
+                price = float(item.get("price", 0) or 0)
+                vol = int(item.get("volume", 0) or 0)
+                if (sym and 5.0 <= price <= 1000.0 and vol >= 500_000
+                        and "." not in sym and len(sym) <= 5
+                        and sym not in ALL_SYMBOLS_SET):
+                    candidates.add(sym)
+
+        # 2. Top movers by % change (1 API call)
+        movers = self.alpaca._request(
+            "GET", f"{self.alpaca.data_url}/v1beta1/screener/stocks/movers",
+            params={"top": 25},
+        )
+        if movers:
+            for item in movers.get("gainers", []) + movers.get("losers", []):
+                sym = item.get("symbol", "")
+                price = float(item.get("price", 0) or 0)
+                change = abs(float(item.get("percent_change", 0) or 0))
+                if (sym and 5.0 <= price <= 1000.0 and change >= 3.0
+                        and "." not in sym and len(sym) <= 5
+                        and sym not in ALL_SYMBOLS_SET):
+                    candidates.add(sym)
+
+        dynamic = list(candidates)[:30]
+
+        # Assign sector for dynamic symbols
+        for sym in dynamic:
+            if sym not in SECTOR_MAP:
+                SECTOR_MAP[sym] = "dynamic"
+
+        self._cache = {"symbols": dynamic, "ts": time.time()}
+        if dynamic:
+            logger.info(f"Dynamic screener: {len(dynamic)} new symbols: {', '.join(dynamic[:10])}")
+        return dynamic
+
+
 # --- VIX Data (from CBOE / Yahoo proxy) ---
 
 def get_vix_price() -> Optional[float]:
@@ -945,6 +1040,7 @@ class StockTraderState:
     tuned_overrides: dict = field(default_factory=dict)
     regime: str = "bull"
     bandit_state: dict = field(default_factory=dict)
+    symbol_cooldowns: dict = field(default_factory=dict)  # {symbol: expiry_timestamp}
 
     @property
     def open_exposure(self) -> float:
@@ -995,6 +1091,7 @@ class StockTrader:
         self.detector = SignalDetector(self.config, bandit=self.bandit)
         self.regime_detector = RegimeDetector(self.config)
         self.earnings = EarningsCalendar()
+        self.screener = DynamicScreener(self.alpaca, self.config)
 
         # Caches
         self._spy_data_cache = {}
@@ -1077,6 +1174,12 @@ class StockTrader:
             self.state.daily_pnl = 0.0
             self.state.daily_trade_count = 0
             self.state.last_reset_date = today
+            # Purge expired symbol cooldowns
+            now = time.time()
+            self.state.symbol_cooldowns = {
+                sym: exp for sym, exp in self.state.symbol_cooldowns.items()
+                if exp > now
+            }
             self._save_state()
 
     def is_market_open(self) -> bool:
@@ -1216,6 +1319,41 @@ class StockTrader:
 
     # --- Market Context Building ---
 
+    def _pre_filter_snapshots(self, symbols: list[str], top_n: int = 60) -> list[str]:
+        """Use snapshots to quickly filter to the hottest symbols by volume/movement."""
+        if len(symbols) <= top_n:
+            return symbols
+        hot = []
+        for i in range(0, len(symbols), 100):
+            batch = symbols[i:i + 100]
+            data = self.alpaca.get_snapshots_multi(batch)
+            if not data:
+                hot.extend(batch[:10])
+                continue
+            scored = []
+            for sym in batch:
+                snap = data.get(sym)
+                if not snap:
+                    continue
+                daily = snap.get("dailyBar", {})
+                prev = snap.get("prevDailyBar", {})
+                trade = snap.get("latestTrade", {})
+                price = float(trade.get("p", 0) or 0)
+                today_vol = int(daily.get("v", 0) or 0)
+                prev_vol = int(prev.get("v", 1) or 1)
+                prev_close = float(prev.get("c", 0) or 0)
+                if price <= 0 or prev_close <= 0:
+                    continue
+                vol_ratio = today_vol / max(prev_vol, 1)
+                change_pct = abs((price - prev_close) / prev_close)
+                heat = vol_ratio * 0.6 + change_pct * 100 * 0.4
+                scored.append((sym, heat))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            hot.extend([s for s, _ in scored])
+        result = hot[:top_n]
+        logger.info(f"Pre-filter: {len(result)} hot symbols from {len(symbols)} candidates")
+        return result
+
     def _build_market_context(self, symbol: str) -> Optional[MarketContext]:
         """Build full market context for a stock."""
         ctx = MarketContext(symbol=symbol, sector=SECTOR_MAP.get(symbol, "unknown"))
@@ -1231,7 +1369,18 @@ class StockTrader:
         highs = [b["h"] for b in daily_bars]
         lows = [b["l"] for b in daily_bars]
         volumes = [b["v"] for b in daily_bars]
-        ctx.price = closes[-1]
+
+        # Use live quote price during market hours (daily bar close is stale)
+        quote = self.alpaca.get_latest_quote(symbol)
+        if quote and "quote" in quote:
+            q = quote["quote"]
+            mid = (q.get("ap", 0) + q.get("bp", 0)) / 2
+            if mid > 0:
+                ctx.price = mid
+            else:
+                ctx.price = closes[-1]
+        else:
+            ctx.price = closes[-1]
 
         # Daily EMAs
         ema_fast = calc_ema(closes, self.config["daily_ema_fast"])
@@ -1400,6 +1549,13 @@ class StockTrader:
             if pos["symbol"] == signal.symbol:
                 return False
 
+        # Per-symbol cooldown after stop loss (avoid re-entering a losing trade)
+        cooldown_expiry = self.state.symbol_cooldowns.get(signal.symbol, 0)
+        if time.time() < cooldown_expiry:
+            remaining_h = (cooldown_expiry - time.time()) / 3600
+            logger.debug(f"  {signal.symbol}: symbol cooldown ({remaining_h:.1f}h remaining)")
+            return False
+
         # Position sizing
         atr_pct = signal.atr / signal.price if signal.price > 0 else 0.02
         kelly_size = self.state.bankroll * self.config["kelly_fraction"]
@@ -1472,6 +1628,32 @@ class StockTrader:
             if order is None:
                 raise RuntimeError(f"Alpaca order returned None for {signal.symbol}")
             position["order_id"] = order.get("id")
+
+            # Update entry price from fill to avoid stale daily-bar prices
+            fill_price = float(order.get("filled_avg_price") or 0)
+            if fill_price <= 0:
+                # Market orders fill fast — wait briefly then check
+                time.sleep(1)
+                order_id = order.get("id")
+                if order_id:
+                    check = self.alpaca._request(
+                        "GET", f"{self.alpaca.base_url}/v2/orders/{order_id}"
+                    )
+                    if check:
+                        fill_price = float(check.get("filled_avg_price") or 0)
+
+            if fill_price > 0 and abs(fill_price - signal.price) / signal.price > 0.005:
+                logger.info(
+                    f"[{pos_id}] Fill price ${fill_price:.2f} vs signal ${signal.price:.2f} "
+                    f"— updating entry/exits"
+                )
+                atr = signal.atr
+                position["entry_price"] = fill_price
+                position["peak_price"] = fill_price
+                position["current_price"] = fill_price
+                position["shares"] = position_size / fill_price
+                position["take_profit"] = round(fill_price + atr * self.config["tp_atr_mult"], 2)
+                position["stop_loss"] = round(fill_price - atr * self.config["sl_atr_mult"], 2)
         except Exception as e:
             logger.error(f"Alpaca order failed for {signal.symbol}: {e} — rolling back")
             self.state.positions.remove(position)
@@ -1482,13 +1664,13 @@ class StockTrader:
             return False
 
         self._save_state()
-        self._log_trade("OPEN", {**position, "price": signal.price, "pnl": 0})
+        self._log_trade("OPEN", {**position, "price": position["entry_price"], "pnl": 0})
 
         logger.info(
-            f"OPEN [{pos_id}] {signal.symbol} @ ${signal.price:.2f} | "
+            f"OPEN [{pos_id}] {signal.symbol} @ ${position['entry_price']:.2f} | "
             f"${position_size:.2f} | Grade:{signal.quality_grade} "
             f"Score:{signal.confluence_score} | "
-            f"TP=${signal.take_profit:.2f} SL=${signal.stop_loss:.2f} | "
+            f"TP=${position['take_profit']:.2f} SL=${position['stop_loss']:.2f} | "
             f"Regime:{signal.regime} | {signal.sector}"
         )
         return True
@@ -1647,6 +1829,9 @@ class StockTrader:
         else:
             self.state.consecutive_losses += 1
             self.state.last_loss_time = time.time()
+            # Per-symbol cooldown: 4 hours after stop loss to avoid re-entering losers
+            if reason == "stop_loss":
+                self.state.symbol_cooldowns[pos["symbol"]] = time.time() + 4 * 3600
 
         if self.state.bankroll > self.state.peak_bankroll:
             self.state.peak_bankroll = self.state.bankroll
@@ -1772,13 +1957,25 @@ class StockTrader:
 
         # 5. Scan universe for new entries
         signals = []
-        # Skip symbols we already hold, or that are removed
         held = {p["symbol"] for p in self.state.positions}
         removed = set(self.state.removed_symbols)
+        skip = held | removed | {"SPY", "UVXY"}
 
-        scan_symbols = [s for s in ALL_SYMBOLS
-                       if s not in held and s not in removed
-                       and s not in ("SPY", "UVXY")]
+        # Static universe
+        static_symbols = [s for s in ALL_SYMBOLS if s not in skip]
+
+        # Dynamic screener: discover hot stocks outside static universe
+        dynamic_symbols = []
+        try:
+            dynamic_symbols = [s for s in self.screener.screen() if s not in skip]
+        except Exception as e:
+            logger.warning(f"Dynamic screener failed: {e}")
+
+        # Merge: dynamic first (they're "hot"), then static
+        all_scan = dynamic_symbols + static_symbols
+
+        # Pre-filter via snapshots: pick the ~60 hottest symbols
+        scan_symbols = self._pre_filter_snapshots(all_scan)
 
         # Rate-limit friendly: process in batches
         batch_size = 10
