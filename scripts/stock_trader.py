@@ -56,17 +56,23 @@ STOCK_CONFIG = {
     # Confluence
     "min_confluence_score": 5,
     "min_signal_quality": "C",
-    # Exits (ATR-based)
-    "tp_atr_mult": 3.0,             # Take profit at 3x daily ATR
-    "sl_atr_mult": 1.5,             # Stop loss at 1.5x daily ATR
-    "trailing_atr_mult": 1.5,       # Trailing stop at 1.5x ATR
-    "trailing_activation_atr": 2.0,  # Activate trailing after 2x ATR profit
+    # Exits (ATR-based) — 2026-06-13 rebalance based on 28-day live data:
+    # Old TP=3.0x ATR fired 3 times in 93 trades (3% fire rate). Old SL=1.5x ATR
+    # got hit 43 times (46% fire rate), 27 of those within an hour of entry
+    # (entry-time noise). The asymmetry destroyed expectancy: wins +6.18%,
+    # losses -6.72%, WR 42% -> -1.3% EV per trade. New geometry inverts R:R
+    # to 0.75:1 but should fire TP much more often, locking in mid-sized wins
+    # that previously reverted to time_exit at +$0.37 avg.
+    "tp_atr_mult": 1.5,             # was 3.0 — half-distance for realistic fire rate
+    "sl_atr_mult": 2.0,             # was 1.5 — give entries an hour of room
+    "trailing_atr_mult": 1.0,       # was 1.5 — tighter trail to protect TP-zone gains
+    "trailing_activation_atr": 1.0,  # was 2.0 — start trailing earlier
     "breakeven_at_1r": True,         # Move stop to breakeven after 1R profit
     "max_hold_days": 10,             # Max 10 trading days
     # Progressive stop tightening
     "progressive_stop": True,
     "progressive_stop_start_pct": 0.5,   # Start tightening at 50% of max hold
-    "progressive_stop_end_mult": 0.33,   # Tighten SL from 1.5x to 0.5x ATR
+    "progressive_stop_end_mult": 0.33,   # Tighten SL from 2.0x to 0.66x ATR by end of hold
     # Circuit breakers
     "max_daily_loss_pct": -0.03,     # -3% of bankroll
     "max_consecutive_losses": 3,
