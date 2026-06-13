@@ -1829,9 +1829,22 @@ class StockTrader:
         else:
             self.state.consecutive_losses += 1
             self.state.last_loss_time = time.time()
-            # Per-symbol cooldown: 4 hours after stop loss to avoid re-entering losers
-            if reason == "stop_loss":
-                self.state.symbol_cooldowns[pos["symbol"]] = time.time() + 4 * 3600
+            # 2026-06-13: tightened from 4h after observing KLAC bleed -$18 over
+            # 4 re-entries in 28 days (cooldown kept expiring). Any losing close
+            # now cools the symbol for 7d; two losses inside 30d remove it.
+            if reason in ("stop_loss", "drawdown_kill", "max_hold", "trailing_stop"):
+                sym = pos["symbol"]
+                self.state.symbol_cooldowns[sym] = time.time() + 7 * 24 * 3600
+                recent_losses = sum(
+                    1 for t in self.state.closed_trades[-100:]
+                    if t.get("symbol") == sym
+                    and t.get("pnl", 0) < 0
+                    and (time.time() - datetime.fromisoformat(t["closed_at"]).timestamp() < 30 * 24 * 3600
+                         if t.get("closed_at") else True)
+                )
+                if recent_losses >= 2 and sym not in self.state.removed_symbols:
+                    self.state.removed_symbols.append(sym)
+                    logger.warning(f"Removing {sym} from universe after {recent_losses} losses in 30d")
 
         if self.state.bankroll > self.state.peak_bankroll:
             self.state.peak_bankroll = self.state.bankroll

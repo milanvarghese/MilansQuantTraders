@@ -328,49 +328,78 @@ class PaperTrader:
     def update_prices(self):
         """Fetch current prices for all open positions.
 
-        BUG FIX: Uses query param ?condition_id= instead of path param /markets/{id}
-        which was returning 404s. Gamma API uses conditionId as query param.
+        2026-06-13: rewrote after diagnosis showed all closes were happening at
+        pnl=$0. Three live bugs in the prior implementation:
+          1. Used ?condition_id= (singular) — API silently ignored it and
+             returned a random page of 20 unrelated markets.
+          2. Iterated market["tokens"] — that field no longer exists; the API
+             now exposes outcomes/outcomePrices as parallel JSON-encoded strings.
+          3. Fell back to pos["entry_price"] on any failure, so a broken fetch
+             was indistinguishable from "no price movement" — and exits ran at
+             entry price, producing pnl=$0 + bogus actual_outcome=0.0.
+        Now: filter the response, parse the two parallel arrays, and only mark
+        the position stale (price_stale=True) when fetch fails — exits skip
+        stale positions instead of closing them at entry price.
         """
+        import json as _json
+
         for pos in self.state.positions:
+            updated = False
             try:
-                # FIX: Use query param, not path param (was causing 404s)
                 resp = self.session.get(
                     f"{GAMMA_API_URL}/markets",
-                    params={"condition_id": pos["market_id"]},
+                    params={"condition_ids": pos["market_id"]},
                     timeout=15,
                 )
                 if resp.status_code != 200:
                     logger.debug(f"Price update HTTP {resp.status_code} for {pos['id']}")
-                    continue
+                else:
+                    data = resp.json()
+                    markets = data if isinstance(data, list) else [data]
+                    # Defensive: confirm the API actually returned the market we asked for
+                    target = (pos.get("market_id") or "").lower()
+                    market = next(
+                        (m for m in markets if (m.get("conditionId") or "").lower() == target),
+                        None,
+                    )
+                    if market is None:
+                        logger.debug(f"Market {pos['market_id'][:12]}... not in response for {pos['id']}")
+                    else:
+                        # outcomes/outcomePrices are JSON-encoded strings: '["Yes","No"]', '["0.51","0.49"]'
+                        try:
+                            outcomes_raw = market.get("outcomes")
+                            prices_raw = market.get("outcomePrices")
+                            outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
+                            prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else (prices_raw or [])
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f"Could not parse outcomes for {pos['id']}: {e}")
+                            outcomes, prices = [], []
 
-                data = resp.json()
-                # API returns a list when using query params
-                market = data[0] if isinstance(data, list) and data else data
-                if not market:
-                    continue
+                        target_side = (pos.get("side") or "").upper()
+                        new_price = None
+                        for outcome_name, price_str in zip(outcomes, prices):
+                            if outcome_name.upper() == target_side:
+                                try:
+                                    new_price = float(price_str)
+                                except (ValueError, TypeError):
+                                    pass
+                                break
 
-                tokens = market.get("tokens", [])
-
-                # FIX: Match by outcome name, don't assume ordering
-                for token in tokens:
-                    outcome = token.get("outcome", "").lower()
-                    if (pos["side"] == "YES" and outcome == "yes") or \
-                       (pos["side"] == "NO" and outcome == "no"):
-                        new_price = float(token.get("price", pos["entry_price"]))
-                        old_price = pos.get("current_price", pos["entry_price"])
-                        pos["current_price"] = new_price
-                        pos["unrealized_pnl"] = round(
-                            (new_price - pos["entry_price"]) * pos["shares"], 2
-                        )
-                        # Track peak price for trailing stop
-                        peak = pos.get("peak_price", pos["entry_price"])
-                        if new_price > peak:
-                            pos["peak_price"] = new_price
-                        break
+                        if new_price is not None:
+                            pos["current_price"] = new_price
+                            pos["unrealized_pnl"] = round((new_price - pos["entry_price"]) * pos["shares"], 2)
+                            pos["price_stale"] = False
+                            peak = pos.get("peak_price", pos["entry_price"])
+                            if new_price > peak:
+                                pos["peak_price"] = new_price
+                            updated = True
 
                 time.sleep(0.3)
             except Exception as e:
                 logger.debug(f"Price update failed for {pos['id']}: {e}")
+
+            if not updated:
+                pos["price_stale"] = True
 
         self._save_state()
 
@@ -392,6 +421,21 @@ class PaperTrader:
             entry_price = pos["entry_price"]
             peak_price = pos.get("peak_price", entry_price)
             estimated_prob = pos.get("estimated_prob", 0.5)
+
+            # 2026-06-13: skip exits when the latest fetch failed. Closing on
+            # stale data was the root cause of all-trades-pnl=$0 — current_price
+            # silently fell back to entry_price. The "expired" path still runs
+            # below because that's a calendar check, not a price check.
+            if pos.get("price_stale"):
+                if pos.get("end_date"):
+                    try:
+                        end = datetime.strptime(pos["end_date"], "%Y-%m-%d")
+                        end = end.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                        if datetime.now(timezone.utc) > end:
+                            to_close.append((pos, "expired", current_price))
+                    except (ValueError, TypeError):
+                        pass
+                continue
 
             # 1. KILL SWITCH: price crashed (position is almost worthless)
             if current_price < 0.03:

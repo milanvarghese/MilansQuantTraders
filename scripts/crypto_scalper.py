@@ -92,10 +92,11 @@ SCALPER_CONFIG = {
     "min_confluence_score": 7,       # 2026-05-15: hard-coded 7 after live data showed 41% WR with score=5/6
     "min_signal_quality": "C",       # Accept C-grade+ signals
     "min_ranging_score": 7,          # 2026-05-15: matched to min_confluence_score
-    # Pair whitelist: data-validated winners only (live 50-day perf 2026-05-15)
-    # Kept: pairs with WR >=47% AND n>=15 AND PnL>=$0 on live trading
-    # Removed: BTC (50% WR n=30 but -$0.09), ETH/DOGE/LINK/SOL/NEAR/APT/XRP/etc (all losing)
-    "pair_whitelist": ["AVAX", "SEI", "INJ", "ATOM", "SUI", "ADA"],
+    # Pair whitelist — narrowed again on 2026-06-13 after 28 more days of live data:
+    #   AVAX +$0.73 (57% WR, n=30), ADA +$0.78 (59% WR, n=27)  -> KEEP
+    #   ATOM -$0.34, SUI -$0.35, SEI -$0.47, INJ -$0.14         -> DROP
+    # Net of 6-pair whitelist was +$0.07; AVAX+ADA alone would have netted +$1.51.
+    "pair_whitelist": ["AVAX", "ADA"],
     # Regime-adaptive thresholds
     "adx_trending": 25,              # ADX > 25 = trending
     "adx_ranging": 20,               # ADX < 20 = ranging
