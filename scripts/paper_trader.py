@@ -69,7 +69,14 @@ class PaperState:
 
     @property
     def open_exposure(self) -> float:
-        return sum(p["cost_usd"] for p in self.positions)
+        # 2026-06-24: exclude dutch_book "ALL"-side positions from active-risk count.
+        # They're multi-outcome arb bets whose capital is committed until calendar
+        # resolution — they can't be closed early on price signals — so counting
+        # them against max_exposure_pct was permanently blocking new trades once a
+        # few accumulated. Their principal is still deducted from bankroll, so the
+        # bot can't over-spend; this just stops old dutch_book bets from crowding
+        # out fresh directional entries.
+        return sum(p["cost_usd"] for p in self.positions if p.get("side", "").upper() != "ALL")
 
     @property
     def unrealized_pnl(self) -> float:
@@ -344,6 +351,15 @@ class PaperTrader:
         import json as _json
 
         for pos in self.state.positions:
+            # 2026-06-24: dutch_book positions bought all outcomes at once
+            # (side="ALL"); there's no single YES/NO price to fetch and they can
+            # only close on calendar expiry. Skip them entirely so they don't
+            # get flagged price_stale (which would keep the log noisy) and don't
+            # ever produce a bogus close on entry-price data.
+            if (pos.get("side") or "").upper() == "ALL":
+                pos["price_stale"] = False
+                continue
+
             updated = False
             try:
                 resp = self.session.get(
