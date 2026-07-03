@@ -36,9 +36,29 @@ REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reports")
 HISTORY_FILE = os.path.join(REPORT_DIR, "backtest_history.csv")
 
 
+def _git_commit() -> str:
+    """Current git commit short hash for run provenance."""
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            stderr=subprocess.DEVNULL, timeout=5,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
 def log_result(run_id: str, description: str, result: BacktestResult,
-               config: dict, config_changes: str = ""):
-    """Append a backtest result to the history CSV."""
+               config: dict, config_changes: str = "",
+               backtester: ScalperBacktester = None):
+    """Append a backtest result to the history CSV.
+
+    2026-07-03 (engine v2): rows now record data window, pair set, git commit,
+    spread setting, and engine version — earlier rows never recorded which
+    data snapshot they ran on, so re-downloads silently shifted the whole
+    comparison window. On schema change the old file is rotated aside.
+    """
     os.makedirs(REPORT_DIR, exist_ok=True)
 
     wr = result.winning_trades / result.total_trades if result.total_trades > 0 else 0
@@ -48,6 +68,9 @@ def log_result(run_id: str, description: str, result: BacktestResult,
     sl_exits = result.by_exit_reason.get("stop_loss", {}).get("total", 0)
     trail_exits = result.by_exit_reason.get("trailing_stop", {}).get("total", 0)
     time_exits = result.by_exit_reason.get("time_exit", {}).get("total", 0)
+
+    def _ts(t):
+        return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d") if t else ""
 
     row = {
         "run_id": run_id,
@@ -68,7 +91,26 @@ def log_result(run_id: str, description: str, result: BacktestResult,
         "trail_exits": trail_exits,
         "time_exits": time_exits,
         "config_changes": config_changes,
+        # v2 provenance
+        "engine": "v2",
+        "git_commit": _git_commit(),
+        "pairs": "|".join(backtester.pairs_used) if backtester else "",
+        "data_start": _ts(backtester.data_start_ts) if backtester else "",
+        "data_end": _ts(backtester.data_end_ts) if backtester else "",
+        "spread_pct": config.get("spread_pct", 0.0005),
+        "taker_fee_pct": config.get("taker_fee_pct", ""),
     }
+
+    # Rotate the history file if it predates the v2 schema — v1 rows were
+    # produced by an engine with lookahead bias and are not comparable anyway.
+    if os.path.exists(HISTORY_FILE) and os.path.getsize(HISTORY_FILE) > 10:
+        with open(HISTORY_FILE, "r", newline="") as f:
+            first_line = f.readline().strip()
+        if "engine" not in first_line.split(","):
+            rotated = HISTORY_FILE.replace(".csv", "_v1_pre2026-07-03.csv")
+            if not os.path.exists(rotated):
+                os.replace(HISTORY_FILE, rotated)
+                logger.info(f"Rotated v1 history to {rotated}")
 
     file_exists = os.path.exists(HISTORY_FILE)
     with open(HISTORY_FILE, "a", newline="") as f:
@@ -98,7 +140,7 @@ def run_test(description: str, config_overrides: dict = None,
     bt = ScalperBacktester(config=config, bankroll=50.0)
     result = bt.run(pairs, days=days)
 
-    row = log_result(run_id, description, result, config, changes_str)
+    row = log_result(run_id, description, result, config, changes_str, backtester=bt)
 
     wr = result.winning_trades / result.total_trades if result.total_trades > 0 else 0
     tp = result.by_exit_reason.get("take_profit", {}).get("total", 0)

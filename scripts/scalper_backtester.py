@@ -8,6 +8,27 @@ Historical order book / funding rate data is not freely available, so those
 signals are set to neutral. This tests the 11 technical signals that can
 be computed from OHLCV data alone.
 
+2026-07-03 ENGINE v2 — correctness overhaul after a live-vs-backtest audit
+(backtest PF 1.77 vs live 0.66-1.09 at identical fees):
+  1. LOOKAHEAD FIXED: the 1h window previously included the aggregated candle
+     for the CURRENT hour — up to ~55 min of future data leaking into the ATR
+     that sizes TP/SL, plus trend/ADX/swing levels. Now only completed hours
+     are used, plus a partial current-hour candle built from 5m bars up to
+     "now" (matching what live Coinbase returns mid-hour).
+  2. SAME-BAR FILLS PESSIMISTIC: when one bar touches both TP and SL, the SL
+     is awarded (was TP-first = systematically optimistic). Gap-through fills
+     execute at the bar open when it gapped past the level.
+  3. SPREAD/SLIPPAGE: config "spread_pct" (default 0.05%/side) is charged on
+     entry+exit notional in addition to taker fees. Zero-spread fills were
+     flattering every result.
+  4. RISK BREAKERS WIRED: daily loss / daily trade / consecutive-loss limits
+     were checked but their counters never updated — dead code. Now live.
+  5. EQUITY-BASED METRICS: Sharpe, drawdown, and peak are computed on
+     mark-to-market equity (cash + open positions), not cash — cash-basis hid
+     drawdown while capital sat in losing positions.
+Results from the v1 engine (backtest_history rows before 2026-07-03) are NOT
+comparable and were inflated by construction.
+
 Usage:
     python scripts/scalper_backtester.py                     # Backtest all pairs with data
     python scripts/scalper_backtester.py --pairs BTC,ETH     # Specific pairs only
@@ -305,6 +326,7 @@ class BacktestPosition:
     peak_price: float = 0.0
     trough_price: float = 999999.0
     breakeven_moved: bool = False
+    last_price: float = 0.0  # v2: latest close, for mark-to-market equity
 
 
 @dataclass
@@ -374,6 +396,26 @@ class ScalperBacktester:
         self.equity_curve: list[float] = []
         self.daily_returns: list[float] = []
         self._prev_equity = bankroll
+        # v2: risk-breaker counters — previously loop-locals that were checked
+        # but never updated by position closes (dead circuit breakers)
+        self._daily_pnl = 0.0
+        self._trades_today = 0
+        self._consecutive_losses = 0
+        # v2: provenance for backtest_history.csv
+        self.data_start_ts: int = 0
+        self.data_end_ts: int = 0
+        self.pairs_used: list = []
+
+    def _equity(self) -> float:
+        """Mark-to-market equity: cash + open positions at last known price."""
+        eq = self.bankroll
+        for p in self.positions:
+            last = p.last_price or p.entry_price
+            if p.side == "buy":
+                eq += p.cost_usd + (last - p.entry_price) * p.shares
+            else:
+                eq += p.cost_usd + (p.entry_price - last) * p.shares
+        return eq
 
     def run(self, pairs: list[str], days: Optional[int] = None) -> BacktestResult:
         """Run backtest across all pairs.
@@ -440,10 +482,12 @@ class ScalperBacktester:
 
         total_bars = len(sorted_timestamps)
         warmup = 50 * 12  # 50 hours of warmup for indicators (50 1H candles)
-        daily_pnl = 0.0
-        trades_today = 0
-        consecutive_losses = 0
         last_day = None
+
+        # v2 provenance
+        self.pairs_used = sorted(pair_data.keys())
+        self.data_start_ts = sorted_timestamps[0]
+        self.data_end_ts = sorted_timestamps[-1]
 
         logger.info(f"Backtesting {len(pair_data)} pairs over {total_bars} bars "
                      f"({total_bars * 5 / 60 / 24:.0f} days)")
@@ -452,15 +496,15 @@ class ScalperBacktester:
             ts = sorted_timestamps[bar_idx]
             current_day = ts // 86400
 
-            # Daily reset
+            # Daily reset (v2: returns measured on mark-to-market equity, not cash)
             if last_day is not None and current_day != last_day:
+                cur_eq = self._equity()
                 if self._prev_equity > 0:
-                    daily_ret = (self.bankroll - self._prev_equity) / self._prev_equity
-                    self.daily_returns.append(daily_ret)
-                self._prev_equity = self.bankroll
-                daily_pnl = 0.0
-                trades_today = 0
-                consecutive_losses = 0
+                    self.daily_returns.append((cur_eq - self._prev_equity) / self._prev_equity)
+                self._prev_equity = cur_eq
+                self._daily_pnl = 0.0
+                self._trades_today = 0
+                self._consecutive_losses = 0
             last_day = current_day
 
             # Update positions with current prices (every bar)
@@ -473,12 +517,12 @@ class ScalperBacktester:
             if bar_idx % scan_interval_bars != 0:
                 continue
 
-            # Risk checks
-            if daily_pnl <= self.config["max_daily_loss"]:
+            # Risk checks (v2: counters are now actually updated on closes)
+            if self._daily_pnl <= self.config["max_daily_loss"]:
                 continue
-            if trades_today >= self.config["max_daily_trades"]:
+            if self._trades_today >= self.config["max_daily_trades"]:
                 continue
-            if consecutive_losses >= self.config["max_consecutive_losses"]:
+            if self._consecutive_losses >= self.config["max_consecutive_losses"]:
                 continue
 
             # BTC returns up to this point for vol tracker
@@ -515,18 +559,43 @@ class ScalperBacktester:
                     continue
                 window_5m = candles_5m_all[window_end - 49:window_end + 1]
 
-                # Get 1h window (last 50 1h candles)
+                # Get 1h window — v2 LOOKAHEAD FIX. The old code took the
+                # aggregated candle at hour_ts, i.e. the FULL current hour,
+                # exposing up to ~55 min of future highs/lows/closes to the
+                # ATR that sizes TP/SL (plus trend/ADX/swing levels). Use only
+                # COMPLETED hours, then append a partial current-hour candle
+                # built from 5m bars up to ts — exactly what live Coinbase
+                # returns mid-hour.
                 hour_ts = (ts // 3600) * 3600
+                now_ts = ts + 300  # current 5m bar's close time
                 candles_1h_all = pair_data[symbol]["1h"]
-                window_1h_end = 0
+                window_1h_end = -1
                 for i, c in enumerate(candles_1h_all):
-                    if c["time"] <= hour_ts:
+                    if c["time"] + 3600 <= now_ts:  # hour fully closed by "now"
                         window_1h_end = i
                     else:
                         break
-                if window_1h_end < 30:
+                if window_1h_end < 0:
                     continue
-                window_1h = candles_1h_all[max(0, window_1h_end - 49):window_1h_end + 1]
+                completed_1h = candles_1h_all[max(0, window_1h_end - 48):window_1h_end + 1]
+
+                window_1h = list(completed_1h)
+                if not completed_1h or completed_1h[-1]["time"] < hour_ts:
+                    partial_bars = [c for c in window_5m
+                                    if hour_ts <= c["time"] <= ts]
+                    if partial_bars:
+                        window_1h.append({
+                            "time": hour_ts,
+                            "open": partial_bars[0]["open"],
+                            "high": max(b["high"] for b in partial_bars),
+                            "low": min(b["low"] for b in partial_bars),
+                            "close": partial_bars[-1]["close"],
+                            "volume": sum(b["volume"] for b in partial_bars),
+                        })
+                if len(window_1h) < 30:
+                    continue
+                # Causality invariant: nothing in the window may end after "now"
+                assert window_1h[-1]["time"] <= ts, "1h window leaked future data"
 
                 # Build context
                 ctx = build_context_from_candles(
@@ -549,11 +618,12 @@ class ScalperBacktester:
             for signal, ctx in all_signals:
                 if self._open_position(signal, ts):
                     opened += 1
-                    trades_today += 1
+                    self._trades_today += 1
                 if opened >= 2:
                     break
 
-            self.equity_curve.append(self.bankroll)
+            # v2: curve tracks mark-to-market equity, not cash
+            self.equity_curve.append(self._equity())
 
         # Close any remaining positions at last price
         for pos in list(self.positions):
@@ -619,6 +689,7 @@ class ScalperBacktester:
                 pos.peak_price = candle["high"]
             if candle["low"] < pos.trough_price:
                 pos.trough_price = candle["low"]
+            pos.last_price = candle["close"]  # v2: for mark-to-market equity
 
     def _check_exits(self, ts: int, pair_index: dict, pair_data: dict):
         """Check exit conditions using intra-bar high/low for realistic fills."""
@@ -636,20 +707,31 @@ class ScalperBacktester:
             bar_low = candle["low"]
             bar_close = candle["close"]
 
-            # 1. TAKE PROFIT
-            if is_long and bar_high >= pos.take_profit:
-                to_close.append((pos, "take_profit", pos.take_profit, ts))
-                continue
-            elif not is_long and bar_low <= pos.take_profit:
-                to_close.append((pos, "take_profit", pos.take_profit, ts))
-                continue
+            bar_open = candle["open"]
 
-            # 2. STOP LOSS
+            # 1. STOP LOSS — v2: checked BEFORE take profit. When a single bar
+            # touches both levels, the worse outcome is awarded (the old
+            # TP-first ordering was systematically optimistic — a stop order
+            # usually fills before a limit at the opposite extreme).
+            # Gap-through: if the bar OPENED beyond the stop, fill at the open.
             if is_long and bar_low <= pos.stop_loss:
-                to_close.append((pos, "stop_loss", pos.stop_loss, ts))
+                fill = min(pos.stop_loss, bar_open)
+                to_close.append((pos, "stop_loss", fill, ts))
                 continue
             elif not is_long and bar_high >= pos.stop_loss:
-                to_close.append((pos, "stop_loss", pos.stop_loss, ts))
+                fill = max(pos.stop_loss, bar_open)
+                to_close.append((pos, "stop_loss", fill, ts))
+                continue
+
+            # 2. TAKE PROFIT (limit order: an open beyond the level fills at
+            # the open, which is a BETTER price)
+            if is_long and bar_high >= pos.take_profit:
+                fill = max(pos.take_profit, bar_open)
+                to_close.append((pos, "take_profit", fill, ts))
+                continue
+            elif not is_long and bar_low <= pos.take_profit:
+                fill = min(pos.take_profit, bar_open)
+                to_close.append((pos, "take_profit", fill, ts))
                 continue
 
             # 3. BREAKEVEN STOP
@@ -741,13 +823,24 @@ class ScalperBacktester:
         entry_fee = pos.cost_usd * fee_pct
         exit_value = exit_price * pos.shares
         exit_fee = exit_value * fee_pct
-        total_fees = entry_fee + exit_fee
+        # v2: spread/slippage — charged per side on notional. Zero-spread fills
+        # were flattering every prior result; live paper fills cross the book.
+        spread_pct = self.config.get("spread_pct", 0.0005)
+        spread_cost = (pos.cost_usd + exit_value) * spread_pct
+        total_fees = entry_fee + exit_fee + spread_cost
         pnl = round(gross_pnl - total_fees, 4)
         pnl_pct = (pnl / pos.cost_usd) * 100 if pos.cost_usd > 0 else 0
 
         self.bankroll += pos.cost_usd + pnl
         if self.bankroll > self.peak_bankroll:
             self.peak_bankroll = self.bankroll
+
+        # v2: feed the risk breakers (previously dead — checked but never updated)
+        self._daily_pnl += pnl
+        if pnl < 0:
+            self._consecutive_losses += 1
+        elif pnl > 0:
+            self._consecutive_losses = 0
 
         hold_bars = (exit_ts - pos.entry_time) // 300  # 5m bars
 
@@ -799,21 +892,39 @@ class ScalperBacktester:
                                 if result.gross_loss > 0 else float('inf'))
         result.avg_hold_bars = sum(t.hold_bars for t in self.trades) / len(self.trades)
 
-        # Max drawdown
-        peak = self.starting_bankroll
-        max_dd = 0
-        max_dd_usd = 0
-        running = self.starting_bankroll
-        for t in self.trades:
-            running += t.pnl
-            if running > peak:
-                peak = running
-            dd = (peak - running) / peak if peak > 0 else 0
-            dd_usd = peak - running
-            if dd > max_dd:
-                max_dd = dd
-            if dd_usd > max_dd_usd:
-                max_dd_usd = dd_usd
+        # Max drawdown — v2: computed on the mark-to-market equity curve.
+        # The old cash walk booked P&L only at close, hiding drawdown while
+        # capital sat in losing open positions.
+        curve = self.equity_curve
+        if curve:
+            peak = curve[0]
+            max_dd = 0
+            max_dd_usd = 0
+            for eq in curve:
+                if eq > peak:
+                    peak = eq
+                dd = (peak - eq) / peak if peak > 0 else 0
+                dd_usd = peak - eq
+                if dd > max_dd:
+                    max_dd = dd
+                if dd_usd > max_dd_usd:
+                    max_dd_usd = dd_usd
+            result.peak_bankroll = max(curve)
+        else:
+            peak = self.starting_bankroll
+            max_dd = 0
+            max_dd_usd = 0
+            running = self.starting_bankroll
+            for t in self.trades:
+                running += t.pnl
+                if running > peak:
+                    peak = running
+                dd = (peak - running) / peak if peak > 0 else 0
+                dd_usd = peak - running
+                if dd > max_dd:
+                    max_dd = dd
+                if dd_usd > max_dd_usd:
+                    max_dd_usd = dd_usd
         result.max_drawdown_pct = max_dd * 100
         result.max_drawdown_usd = max_dd_usd
 
