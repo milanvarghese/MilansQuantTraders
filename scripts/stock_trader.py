@@ -68,7 +68,12 @@ STOCK_CONFIG = {
     "trailing_atr_mult": 1.0,       # was 1.5 — tighter trail to protect TP-zone gains
     "trailing_activation_atr": 1.0,  # was 2.0 — start trailing earlier
     "breakeven_at_1r": True,         # Move stop to breakeven after 1R profit
-    "max_hold_days": 10,             # Max 10 trading days
+    # 2026-07-03: was "max_hold_days: 10" with hold_days = wall_hours/6.5 — a units
+    # bug that actually forced exits at ~66 wall-clock hours. Audit showed that
+    # accidental ~2.7-day flatten was the WINNING exit (time_exit WR 69-80%), so the
+    # empirical behavior is preserved deliberately as an explicit wall-clock knob.
+    # Re-derive the value in a stock backtester before changing it.
+    "max_hold_hours": 66,            # Max hold in wall-clock hours
     # Progressive stop tightening
     "progressive_stop": True,
     "progressive_stop_start_pct": 0.5,   # Start tightening at 50% of max hold
@@ -115,50 +120,19 @@ STOCK_CONFIG = {
 
 # --- Trading Universe ---
 UNIVERSE = {
-    "mega_cap": [
-        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK.B",
-        "JPM", "V", "UNH", "MA", "HD", "PG", "JNJ", "LLY", "AVGO", "XOM",
-        "COST", "WMT",
-    ],
+    # 2026-07-03 audit cut (pre-registered forward-test hypothesis, NOT proven edge):
+    # 266 live closes showed growth_tech was the only sector clearing statistical
+    # significance (n=58, PF 2.66, t=2.99), with post-fix wins concentrated in
+    # semiconductors (MU/AMAT/LRCX/INTC/MRVL). sector_leaders ran PF 0.08 (-$29),
+    # high_beta -$14, and the dynamic screener residue -$41 — together more than the
+    # entire net loss. Dropped sectors are in git history; re-widen only via
+    # backtest evidence once a stock backtester exists, never by hand.
     "growth_tech": [
         "AMD", "NFLX", "ADBE", "INTC", "QCOM", "MU",
         "AMAT", "PANW", "SHOP", "SQ", "COIN", "PLTR", "SNOW",
     ],
-    "sector_leaders": [
-        "BA", "CAT", "DE", "GE", "LMT", "PFE", "MRK", "ABBV", "CVX",
-        "COP", "GS", "MS", "DIS", "SBUX", "NKE",
-    ],
-    "high_beta": [
-        "SMCI", "MSTR", "RIVN", "LCID", "SOFI", "HOOD", "RBLX", "SNAP",
-        "ROKU", "UPST",
-    ],
-    "financials": [
-        "BX", "SCHW", "C", "BAC", "WFC", "AXP", "ICE", "CME", "SPGI", "MCO",
-    ],
-    "healthcare_biotech": [
-        "TMO", "ISRG", "VRTX", "REGN", "GILD", "AMGN", "BMY", "ZTS", "SYK", "MDT",
-    ],
-    "industrials": [
-        "HON", "RTX", "UNP", "FDX", "UPS", "WM", "ETN", "ITW", "EMR", "CSX",
-    ],
-    "consumer_retail": [
-        "MCD", "LOW", "TJX", "TGT", "ORLY", "AZO", "ROST", "DG", "YUM", "CMG",
-    ],
     "semiconductors": [
         "MRVL", "KLAC", "LRCX", "ASML", "ADI", "NXPI", "ON", "MCHP", "TXN", "SNPS",
-    ],
-    "software_cloud": [
-        "CRM", "ORCL", "NOW", "WDAY", "DDOG", "NET", "CRWD", "ZS", "TEAM", "FTNT",
-    ],
-    "energy_materials": [
-        "SLB", "EOG", "OXY", "FCX", "NEM", "LIN", "APD", "ECL", "DD", "DOW",
-    ],
-    "media_comm": [
-        "CMCSA", "T", "VZ", "CHTR", "TMUS", "ABNB", "BKNG", "UBER", "LYFT", "DASH",
-    ],
-    "etfs": [
-        "SPY", "QQQ", "IWM", "XLF", "XLE", "XLK", "XLV", "XLI", "XLC",
-        "XLY", "XLP", "SMH", "GLD", "TLT", "UVXY",
     ],
 }
 
@@ -1047,15 +1021,30 @@ class StockTraderState:
     regime: str = "bull"
     bandit_state: dict = field(default_factory=dict)
     symbol_cooldowns: dict = field(default_factory=dict)  # {symbol: expiry_timestamp}
+    trades_since_tune: int = 0  # 2026-07-03: monotonic counter (len%N broke at the cap)
 
     @property
     def open_exposure(self) -> float:
         return sum(p.get("cost_usd", 0) for p in self.positions)
 
     @property
+    def equity(self) -> float:
+        """Cash + market value of open positions (cost basis + unrealized P&L)."""
+        open_value = sum(
+            p.get("cost_usd", 0) + p.get("unrealized_pnl", 0) for p in self.positions
+        )
+        return self.bankroll + open_value
+
+    @property
     def win_rate(self) -> float:
+        # 2026-07-03 audit fix: winning_trades is all-time but closed_trades is
+        # capped at 100 — the old uncapped/capped ratio drifted above 100%.
+        # Compute wins within the same retained window.
         closed = len(self.closed_trades)
-        return self.winning_trades / closed if closed > 0 else 0.0
+        if closed == 0:
+            return 0.0
+        wins = sum(1 for t in self.closed_trades if t.get("pnl", 0) > 0)
+        return wins / closed
 
     @property
     def avg_pnl(self) -> float:
@@ -1063,9 +1052,12 @@ class StockTraderState:
 
     @property
     def drawdown_pct(self) -> float:
+        # 2026-07-03 audit fix: measured on EQUITY, not cash. Cash-based drawdown
+        # tripped the -15% pause just by opening 8 x $20 positions with zero losses
+        # (and ~12 open positions would have hit the -25% kill switch on a healthy book).
         if self.peak_bankroll <= 0:
             return 0.0
-        return (self.bankroll - self.peak_bankroll) / self.peak_bankroll
+        return (self.equity - self.peak_bankroll) / self.peak_bankroll
 
 
 # --- Main Bot ---
@@ -1378,15 +1370,10 @@ class StockTrader:
 
         # Use live quote price during market hours (daily bar close is stale)
         quote = self.alpaca.get_latest_quote(symbol)
+        mid = None
         if quote and "quote" in quote:
-            q = quote["quote"]
-            mid = (q.get("ap", 0) + q.get("bp", 0)) / 2
-            if mid > 0:
-                ctx.price = mid
-            else:
-                ctx.price = closes[-1]
-        else:
-            ctx.price = closes[-1]
+            mid = self._safe_quote_mid(quote["quote"], closes[-1])
+        ctx.price = mid if mid is not None else closes[-1]
 
         # Daily EMAs
         ema_fast = calc_ema(closes, self.config["daily_ema_fast"])
@@ -1695,20 +1682,43 @@ class StockTrader:
             for pos in self.state.positions:
                 quote = self.alpaca.get_latest_quote(pos["symbol"])
                 if quote and "quote" in quote:
-                    q = quote["quote"]
-                    mid = (q.get("ap", 0) + q.get("bp", 0)) / 2
-                    if mid > 0:
+                    ref = pos.get("current_price", pos["entry_price"])
+                    mid = self._safe_quote_mid(quote["quote"], ref)
+                    if mid is not None:
                         self._update_position_price(pos, mid)
+                    else:
+                        logger.debug(f"[{pos['id']}] rejected unusable quote for {pos['symbol']}")
                 time.sleep(0.1)
         else:
             for pos in self.state.positions:
                 q = quotes["quotes"].get(pos["symbol"])
                 if q:
-                    mid = (q.get("ap", 0) + q.get("bp", 0)) / 2
-                    if mid > 0:
+                    ref = pos.get("current_price", pos["entry_price"])
+                    mid = self._safe_quote_mid(q, ref)
+                    if mid is not None:
                         self._update_position_price(pos, mid)
+                    else:
+                        logger.debug(f"[{pos['id']}] rejected unusable quote for {pos['symbol']}")
 
         self._save_state()
+
+    @staticmethod
+    def _safe_quote_mid(q: dict, reference_price: float = 0.0) -> Optional[float]:
+        """Quote midpoint, or None if the quote is unusable.
+
+        2026-07-03 audit fix: one-sided IEX quotes (ap=0 or bp=0) previously
+        produced half-price mids that triggered phantom ~-50% stop-losses
+        (BAND/RLYB/CAT — ~47% of total stock loss). Require both sides and,
+        when a reference price is known, reject mids >20% away from it.
+        """
+        ap = q.get("ap") or 0
+        bp = q.get("bp") or 0
+        if ap <= 0 or bp <= 0:
+            return None
+        mid = (ap + bp) / 2
+        if reference_price and reference_price > 0 and abs(mid - reference_price) / reference_price > 0.20:
+            return None
+        return mid
 
     def _update_position_price(self, pos: dict, new_price: float):
         """Update a single position's price and P&L."""
@@ -1728,23 +1738,55 @@ class StockTrader:
             entry = pos["entry_price"]
             atr = pos.get("atr_at_entry", entry * 0.02)
 
-            # Calculate hold time
+            # Calculate hold time (wall-clock; see max_hold_hours comment in config)
             try:
                 opened = datetime.fromisoformat(pos["opened_at"])
                 elapsed_h = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
-                hold_days = elapsed_h / 6.5  # ~6.5 trading hours/day
             except (ValueError, TypeError):
+                opened = None
                 elapsed_h = 0
-                hold_days = 0
+            max_hold_h = self.config.get("max_hold_hours", 66)
+            hold_frac = elapsed_h / max_hold_h if max_hold_h > 0 else 0
 
-            # 1. TAKE PROFIT
-            if current >= pos["take_profit"]:
-                to_close.append((pos, "take_profit", current))
+            # 2026-07-03: intrabar TP/SL. TP was previously compared only against the
+            # scan-time quote mid every 900s, so touches between scans were invisible
+            # (1 take_profit in 31 closes). Use 5-min bar extremes since the last exit
+            # check; a resting stop/limit would have filled at those touches.
+            bar_high = bar_low = None
+            try:
+                since = pos.get("last_exit_check") or pos["opened_at"]
+                since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                bars = self._get_intraday_bars(pos["symbol"], "5Min", limit=80)
+                recent = []
+                for b in bars:
+                    try:
+                        bt = datetime.fromisoformat(b["t"].replace("Z", "+00:00"))
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                    if bt >= since_dt:
+                        recent.append(b)
+                if recent:
+                    bar_high = max(float(b["h"]) for b in recent)
+                    bar_low = min(float(b["l"]) for b in recent)
+            except Exception as e:
+                logger.debug(f"[{pos['id']}] intrabar fetch failed: {e}")
+            pos["last_exit_check"] = datetime.now(timezone.utc).isoformat()
+
+            eff_low = min(v for v in (current, bar_low) if v is not None)
+            eff_high = max(v for v in (current, bar_high) if v is not None)
+
+            # 1. STOP LOSS — checked before TP: when a scan gap touches both levels,
+            # assume the worse outcome (a live stop order would usually fill first).
+            if eff_low <= pos["stop_loss"]:
+                # Wick through: fill at stop. Gap-through-and-stay: fill at current.
+                fill = current if current <= pos["stop_loss"] else pos["stop_loss"]
+                to_close.append((pos, "stop_loss", fill))
                 continue
 
-            # 2. STOP LOSS
-            if current <= pos["stop_loss"]:
-                to_close.append((pos, "stop_loss", current))
+            # 2. TAKE PROFIT
+            if eff_high >= pos["take_profit"]:
+                fill = current if current >= pos["take_profit"] else pos["take_profit"]
+                to_close.append((pos, "take_profit", fill))
                 continue
 
             # 3. BREAKEVEN STOP: move stop to entry after 1R profit
@@ -1766,14 +1808,12 @@ class StockTrader:
                     logger.debug(f"[{pos['id']}] Trail ratcheted to ${trailing_stop:.2f}")
 
             # 5. PROGRESSIVE STOP TIGHTENING
-            if self.config.get("progressive_stop", False) and hold_days > 0:
-                max_hold = self.config["max_hold_days"]
+            if self.config.get("progressive_stop", False) and hold_frac > 0:
                 start_pct = self.config.get("progressive_stop_start_pct", 0.5)
                 end_mult = self.config.get("progressive_stop_end_mult", 0.33)
-                hold_pct = hold_days / max_hold if max_hold > 0 else 0
 
-                if hold_pct >= start_pct:
-                    progress = min(1.0, (hold_pct - start_pct) / (1.0 - start_pct))
+                if hold_frac >= start_pct:
+                    progress = min(1.0, (hold_frac - start_pct) / (1.0 - start_pct))
                     original_sl_dist = atr * self.config["sl_atr_mult"]
                     tight_sl_dist = original_sl_dist * end_mult
                     current_sl_dist = original_sl_dist - (original_sl_dist - tight_sl_dist) * progress
@@ -1781,10 +1821,11 @@ class StockTrader:
                     if new_sl > pos["stop_loss"]:
                         pos["stop_loss"] = new_sl
                         logger.debug(f"[{pos['id']}] Progressive stop -> ${new_sl:.2f} "
-                                   f"({hold_pct:.0%} of max hold)")
+                                   f"({hold_frac:.0%} of max hold)")
 
-            # 6. TIME EXIT: max hold days
-            if hold_days >= self.config["max_hold_days"]:
+            # 6. TIME EXIT: max hold (wall-clock hours; preserves the empirically
+            # winning ~66h flatten — see config comment)
+            if elapsed_h >= max_hold_h:
                 to_close.append((pos, "time_exit", current))
                 continue
 
@@ -1801,14 +1842,27 @@ class StockTrader:
 
     def _close_position(self, pos: dict, reason: str, price: float):
         """Close a position and update state."""
+        # 2026-07-03 audit fix: a persistently failing Alpaca close used to leave a
+        # zombie position locking capital forever. Retry twice, then force-close
+        # locally so paper state stays consistent.
+        close_ok = False
         try:
             result = self.alpaca.close_position(pos["symbol"])
-            if result is None:
-                logger.error(f"Alpaca close failed for {pos['symbol']} — skipping state update")
-                return
+            close_ok = result is not None
         except Exception as e:
-            logger.error(f"Alpaca close error for {pos['symbol']}: {e} — skipping state update")
-            return
+            logger.error(f"Alpaca close error for {pos['symbol']}: {e}")
+        if not close_ok:
+            pos["close_failures"] = pos.get("close_failures", 0) + 1
+            if pos["close_failures"] < 3:
+                logger.error(
+                    f"Alpaca close failed for {pos['symbol']} "
+                    f"({pos['close_failures']}/3) — will retry next scan"
+                )
+                return
+            logger.warning(
+                f"Alpaca close failed {pos['close_failures']}x for {pos['symbol']} — "
+                f"force-closing locally at ${price:.2f} to unlock capital"
+            )
 
         pnl = round((price - pos["entry_price"]) * pos["shares"], 4)
         pos["close_price"] = price
@@ -1838,7 +1892,10 @@ class StockTrader:
             # 2026-06-13: tightened from 4h after observing KLAC bleed -$18 over
             # 4 re-entries in 28 days (cooldown kept expiring). Any losing close
             # now cools the symbol for 7d; two losses inside 30d remove it.
-            if reason in ("stop_loss", "drawdown_kill", "max_hold", "trailing_stop"):
+            # 2026-07-03 audit fix: the original list included "max_hold" and
+            # "trailing_stop", strings this code never emits — losing time_exits
+            # re-entered immediately. Gate on the reasons that actually occur.
+            if reason in ("stop_loss", "time_exit", "drawdown_kill"):
                 sym = pos["symbol"]
                 self.state.symbol_cooldowns[sym] = time.time() + 7 * 24 * 3600
                 recent_losses = sum(
@@ -1852,10 +1909,12 @@ class StockTrader:
                     self.state.removed_symbols.append(sym)
                     logger.warning(f"Removing {sym} from universe after {recent_losses} losses in 30d")
 
-        if self.state.bankroll > self.state.peak_bankroll:
-            self.state.peak_bankroll = self.state.bankroll
+        # 2026-07-03: peak tracked on equity (cash + open positions), matching the
+        # equity-based drawdown_pct fix.
+        if self.state.equity > self.state.peak_bankroll:
+            self.state.peak_bankroll = self.state.equity
 
-        # Update bandit
+        # Update bandit (log-only: weights are recorded but do not affect scoring)
         won = pnl > 0
         for comp in pos.get("components", []):
             self.bandit.update(comp, won)
@@ -1864,6 +1923,7 @@ class StockTrader:
         self.state.closed_trades.append(pos)
         if len(self.state.closed_trades) > 100:
             self.state.closed_trades = self.state.closed_trades[-100:]
+        self.state.trades_since_tune += 1
 
         # Remove from positions
         self.state.positions = [p for p in self.state.positions if p["id"] != pos["id"]]
@@ -1884,11 +1944,13 @@ class StockTrader:
 
     def _auto_tune(self):
         """Auto-tune parameters every N closed trades."""
+        # 2026-07-03 audit fix: the old `len(closed_trades) % n == 0` trigger fired
+        # on EVERY close once the list saturated at its 100-entry cap (100 % 20 == 0).
+        # Use a monotonic counter instead.
         n = self.config["auto_tune_every_n_trades"]
-        if len(self.state.closed_trades) < n:
+        if self.state.trades_since_tune < n or len(self.state.closed_trades) < n:
             return
-        if len(self.state.closed_trades) % n != 0:
-            return
+        self.state.trades_since_tune = 0
 
         recent = self.state.closed_trades[-n:]
         adjustments = []

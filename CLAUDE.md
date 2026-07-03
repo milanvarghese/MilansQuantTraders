@@ -70,10 +70,10 @@ Self-contained trading engine using Alpaca API. Key classes:
 - `AlpacaClient` - Alpaca REST API wrapper (bars, quotes, orders, clock, calendar)
 - `RegimeDetector` - SPY/VIX-based market regime (Bull/Cautious/Bear/HighVol/Choppy) with anti-whipsaw
 - `SignalDetector` - 12-signal confluence scoring (0-12 scale): daily/weekly trend EMAs, RSI bounce, MACD cross, volume spike, relative strength vs SPY, Bollinger band, VWAP reclaim, 52-week proximity, sector momentum, earnings shield, market regime
-- `SignalBandit` - Thompson Sampling bandit auto-weights signals by recent success
+- `SignalBandit` - LOG-ONLY performance tracker (2026-07-03 audit: `get_weight()` is never wired into scoring; weights are recorded per trade for offline analysis, they do NOT affect entries)
 - `EarningsCalendar` - Yahoo Finance earnings date lookup, entry/exit shields
-- `StockTrader` - Main loop: market-hours only (9:30-16:00 ET), scans 110 instruments (20 mega cap + 15 growth/tech + 15 sector leaders + 10 high-beta + 10 ETFs)
-- Exits: TP=3x daily ATR, SL=1.5x ATR, trailing stop after 2x ATR, progressive tightening, 10-day max hold, earnings exit
+- `StockTrader` - Main loop: market-hours only (9:30-16:00 ET). Universe cut 2026-07-03 to growth_tech + semiconductors (23 symbols) — the only sector clearing statistical significance live (growth_tech PF 2.66, t=2.99); dropped sectors are in git history, re-widen only via backtest evidence
+- Exits: TP=1.5x daily ATR, SL=2x ATR (intrabar via 5-min bar extremes, SL-first), trailing stop after 1x ATR, progressive tightening, ~66h wall-clock max hold (empirically the winning exit window), earnings exit
 - Circuit breakers: daily -3% loss limit, 3 consecutive losses cooldown, -15% drawdown pause, -25% kill switch
 - Auto-tunes every 20 closed trades (sector WR, confluence threshold, bandit weights)
 
@@ -120,6 +120,12 @@ These modules work together:
 - **Daily reset**: Counters reset at midnight UTC via `_check_daily_reset()`
 - **Loss cooldown**: 3 consecutive losses triggers 4-hour cooldown (not permanent halt)
 - **Fee model**: Polymarket charges 2% on net winnings (exit proceeds), not on notional
+- **Platt calibration**: `ProbabilityCalibrator` in `probability_engine.py` fits isotonic regression from 30+ resolved trades. Auto-applied to KDE output. Falls through to raw prob if insufficient data
+- **Volatility term structure**: `get_volatility_multiplier()` adjusts KDE bandwidth by season (winter 1.25x, summer 0.95x) and forecast horizon (sqrt scaling: day-2 = 1.41x, day-3 = 1.73x)
+- **Analog day comparison**: `WeatherClient.get_analog_days()` finds 5 best-match historical days using RMSE on 3-day temperature pattern. Mixed into ensemble via `get_ensemble_with_analogs()`
+- **Parallel ensemble**: ECMWF/GFS/ICON fetched concurrently via `ThreadPoolExecutor(3)` (~3s vs ~10s sequential)
+- **Adaptive Kelly**: `_get_dynamic_kelly()` uses composite score from 4 metrics: CLV (35%), Sharpe (25%), win rate (20%), Brier (20%). Maps to Kelly fractions 0.10-0.25
+- **Consolidated state**: `RiskManager.sync_from_paper_state()` syncs from paper_trader on every state save. Paper_trader is single source of truth
 
 ## Server Deployment
 

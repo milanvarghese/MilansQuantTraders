@@ -97,6 +97,13 @@ SCALPER_CONFIG = {
     #   ATOM -$0.34, SUI -$0.35, SEI -$0.47, INJ -$0.14         -> DROP
     # Net of 6-pair whitelist was +$0.07; AVAX+ADA alone would have netted +$1.51.
     "pair_whitelist": ["AVAX", "ADA"],
+    # 2026-07-03 audit (pre-registered hypothesis): long side OFF — live buy PF 0.63,
+    # no positive long subset n>=30. Re-enable only via honest-backtest evidence.
+    "allow_buy_side": False,
+    # 2026-07-03 audit: auto-tuner is log-only (RECOMMEND entries in tuning.json)
+    # until each rule is validated in the fixed backtester. It had permanently
+    # deleted ETH/DOGE on 5-trade samples and ratcheted thresholds one-way.
+    "auto_tune_apply": False,
     # Regime-adaptive thresholds
     "adx_trending": 25,              # ADX > 25 = trending
     "adx_ranging": 20,               # ADX < 20 = ranging
@@ -1213,6 +1220,19 @@ class SignalBandit:
         self._wins = {}   # component -> decayed win count
         self._total = {}  # component -> decayed total count
 
+    def to_dict(self) -> dict:
+        """Serializable state — 2026-07-03: bandit was never persisted before,
+        silently resetting to neutral on every restart/deploy."""
+        return {"wins": dict(self._wins), "total": dict(self._total)}
+
+    @classmethod
+    def from_dict(cls, data: dict, decay: float = 0.95) -> "SignalBandit":
+        b = cls(decay=decay)
+        if isinstance(data, dict):
+            b._wins = dict(data.get("wins", {}))
+            b._total = dict(data.get("total", {}))
+        return b
+
     def record(self, components: list, won: bool):
         """Record trade outcome for each signal component that fired."""
         # Only decay components that are being updated (preserve history for infrequent signals)
@@ -1598,7 +1618,7 @@ class Signal:
     pair: str
     side: str
     signal_type: str
-    confluence_score: int    # 0-10
+    confluence_score: int    # 0-10 (includes regime side-bias + bandit bonus)
     quality_grade: str       # A, B, C, D
     price: float
     rsi: float
@@ -1609,6 +1629,26 @@ class Signal:
     reasoning: str
     components: list         # Which signals fired
     timestamp: str
+    # 2026-07-03 audit: score BEFORE the regime side-bias bonus. A recorded
+    # "score 6" trending_bear short previously had raw strength 4 (+2 bias
+    # baked in pre-gate), which contaminated every score-based analysis.
+    raw_score: int = 0
+    # The min_confluence gate actually in force at entry (regime profiles
+    # override the tuned value every scan — record what was really applied).
+    effective_min_confluence: int = 0
+
+
+# 2026-07-03 audit: components appended to the BUY list when they SUBTRACT
+# points. The bandit must not award them (weight-1) bonuses on buys, and
+# their win/loss credit must not be mixed with their sell-side driver role.
+# (The sell list contains only drivers — its lone penalty, RSI oversold,
+# never appends a component name.)
+BUY_PENALTY_COMPONENTS = frozenset({
+    "1H_TREND_DOWN", "RSI_OVERBOUGHT", "MACD_BEAR_CROSS", "OB_ASK_HEAVY",
+    "VOL_SPIKE_BEAR", "BB_UPPER_TOUCH", "FUNDING_OVERHEATED",
+    "BELOW_VWAP_BEARISH", "SENTIMENT_GREED", "CUSUM_DOWN",
+    "BTC_VOL_ELEVATED", "RSI_DIV_BEAR", "ENGULF_BEAR", "ATR_CONTRACTED",
+})
 
 
 class SignalDetector:
@@ -1828,10 +1868,15 @@ class SignalDetector:
             reasons.append(f"ATR ratio {ctx.atr_ratio:.2f} — volatility expanding")
 
         # === BANDIT-WEIGHTED SCORE (auto-learned signal weighting) ===
+        # 2026-07-03 audit fix: penalty components are excluded (a component that
+        # wins as a SHORT driver was previously INCREASING buy scores when it fired
+        # as a buy penalty), and weights are direction-split ("@buy" keys).
         if self.bandit and components:
             weighted_bonus = 0
             for comp in components:
-                w = self.bandit.get_weight(comp)
+                if comp in BUY_PENALTY_COMPONENTS:
+                    continue
+                w = self.bandit.get_weight(f"{comp}@buy")
                 if w != 1.0:
                     # Adjust: signals with >60% win rate get +0.5, <40% get -0.5
                     weighted_bonus += (w - 1.0)
@@ -1956,14 +2001,21 @@ class SignalDetector:
             sell_score += 1
             sell_components.append("ATR_EXPANDING")
 
-        # Bandit weighting for sell signals
+        # Bandit weighting for sell signals (direction-split keys; the sell list
+        # contains only driver components, so no penalty exclusion needed)
         if self.bandit and sell_components:
             weighted_bonus = 0
             for comp in sell_components:
-                w = self.bandit.get_weight(comp)
+                w = self.bandit.get_weight(f"{comp}@sell")
                 if w != 1.0:
                     weighted_bonus += (w - 1.0)
             sell_score += round(weighted_bonus)
+
+        # 2026-07-03 audit: capture the pre-bias scores. The regime side-bias below
+        # is intentional behavior, but it must be RECORDED separately — analytics
+        # keyed on the biased score conflated raw signal quality with regime bias.
+        raw_buy_score = score
+        raw_sell_score = sell_score
 
         # === MACRO REGIME SIDE BIAS (v3.5) ===
         # Boost preferred direction's score based on current regime profile
@@ -1985,7 +2037,11 @@ class SignalDetector:
         best_reasons = []
 
         # Check buy signal
-        if score >= min_score:
+        # 2026-07-03 (pre-registered forward-test hypothesis, NOT proven edge):
+        # long side gated off — live 78d data shows buy PF 0.63 with no positive
+        # long subset at n>=30; the three worst components are all long-side.
+        # Re-enable only via honest-backtest evidence (allow_buy_side: true).
+        if score >= min_score and self.config.get("allow_buy_side", True):
             buy_grade = "A" if score >= 7 and "1H_TREND_UP" in components else "B" if score >= 5 else "C" if score >= 4 else "D"
             if GRADE_MAP.get(buy_grade, 0) >= GRADE_MAP.get(min_grade, 0):
                 best_side = "buy"
@@ -2055,6 +2111,8 @@ class SignalDetector:
             reasoning=" | ".join(best_reasons),
             components=best_components,
             timestamp=now,
+            raw_score=raw_buy_score if best_side == "buy" else raw_sell_score,
+            effective_min_confluence=min_score,
         )
 
 
@@ -2081,6 +2139,8 @@ class ScalperState:
     last_scan: str = ""
     removed_pairs: list = field(default_factory=list)  # Pairs removed by auto-tune
     tuned_overrides: dict = field(default_factory=dict)  # Persisted auto-tune config overrides
+    trades_since_tune: int = 0    # 2026-07-03: monotonic tune counter (len%20 broke at the 500 cap)
+    bandit_state: dict = field(default_factory=dict)  # 2026-07-03: persist bandit across restarts
 
     @property
     def open_exposure(self) -> float:
@@ -2088,8 +2148,13 @@ class ScalperState:
 
     @property
     def win_rate(self) -> float:
+        # 2026-07-03 audit fix: winning_trades is all-time but closed_trades is
+        # capped at 500 — the old uncapped/capped ratio drifted above 100%.
         closed = len(self.closed_trades)
-        return self.winning_trades / closed if closed > 0 else 0.0
+        if closed == 0:
+            return 0.0
+        wins = sum(1 for t in self.closed_trades if t.get("pnl", 0) > 0)
+        return wins / closed
 
     @property
     def avg_pnl(self) -> float:
@@ -2124,7 +2189,9 @@ class CryptoScalper:
         self.cusum = CUSUMFilter(threshold=self.config.get("cusum_threshold", 0.003))
         self._last_cusum_ts = {}  # pair -> last candle timestamp fed to CUSUM
         self.vol_tracker = CrossAssetVolTracker()
-        self.bandit = SignalBandit(decay=self.config.get("bandit_decay", 0.95))
+        # 2026-07-03: restore persisted bandit state (previously reset on every restart)
+        self.bandit = SignalBandit.from_dict(
+            self.state.bandit_state, decay=self.config.get("bandit_decay", 0.95))
         self.detector = SignalDetector(self.config, bandit=self.bandit)
         # v3.5: Adaptive macro regime system
         self._base_config = dict(self.config)  # Snapshot before regime overrides
@@ -2161,6 +2228,9 @@ class CryptoScalper:
         )
 
     def _save_state(self):
+        # Keep the persisted bandit copy fresh on every save (2026-07-03)
+        if getattr(self, "bandit", None):
+            self.state.bandit_state = self.bandit.to_dict()
         # Atomic write: temp file + rename (prevents corruption on crash/kill)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -2438,6 +2508,27 @@ class CryptoScalper:
             "breakeven_moved": False,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "components": signal.components,
+            # 2026-07-03 audit: record integrity + deterministic exits.
+            # raw_score = pre-side-bias strength; effective_min_confluence = the
+            # gate actually applied (regime profiles override the tuned value).
+            "raw_score": signal.raw_score,
+            "effective_min_confluence": signal.effective_min_confluence,
+            # Snapshot exit geometry at entry: the SL distance actually placed
+            # (incl. vol_adj) and the hold/progressive params in force. Exits read
+            # this snapshot — previously a mid-hold regime flip silently rewrote
+            # exit geometry (e.g. a 48h/3.5x entry force-closed at 12h with a
+            # 0.2x-tightened stop after a flip to low_vol_chop).
+            "entry_sl_dist": round(abs(signal.price - signal.stop_loss), 8),
+            "exit_params": {
+                "sl_atr_mult": self.config["sl_atr_mult"],
+                "tp_atr_mult": self.config["tp_atr_mult"],
+                "max_hold_hours": self.config["max_hold_hours"],
+                "trailing_atr_mult": self.config.get("trailing_atr_mult", 999.0),
+                "breakeven_at_1r": self.config.get("breakeven_at_1r", False),
+                "progressive_stop": self.config.get("progressive_stop", False),
+                "progressive_stop_start_pct": self.config.get("progressive_stop_start_pct", 0.5),
+                "progressive_stop_end_mult": self.config.get("progressive_stop_end_mult", 0.3),
+            },
             # Rich context snapshot for analytics & auto-tuning
             "entry_ob_imbalance": ctx.ob_imbalance if ctx else 0,
             "entry_funding_rate": ctx.funding_rate if ctx else 0,
@@ -2523,9 +2614,17 @@ class CryptoScalper:
                 to_close.append((pos, "stop_loss", current))
                 continue
 
+            # 2026-07-03 audit fix: exit geometry reads the ENTRY-TIME snapshot.
+            # Previously these blocks read current config, so mid-hold regime
+            # flips (possible every ~13 min vs 12-48h holds) silently rewrote
+            # stops, hold limits, and the progressive schedule.
+            exit_cfg = pos.get("exit_params", {})
+            entry_sl_dist = pos.get("entry_sl_dist") or atr * exit_cfg.get(
+                "sl_atr_mult", self.config["sl_atr_mult"])
+
             # 3. BREAKEVEN STOP: move stop to entry after 1R profit
-            if self.config["breakeven_at_1r"] and not pos.get("breakeven_moved"):
-                one_r = atr * self.config["sl_atr_mult"]
+            if exit_cfg.get("breakeven_at_1r", self.config["breakeven_at_1r"]) and not pos.get("breakeven_moved"):
+                one_r = entry_sl_dist
                 if is_long and current >= entry + one_r:
                     pos["stop_loss"] = round(entry + atr * 0.2, 6)  # Slightly above entry
                     pos["breakeven_moved"] = True
@@ -2536,7 +2635,7 @@ class CryptoScalper:
                     logger.info(f"[{pos['id']}] Moved stop to breakeven+")
 
             # 4. TRAILING STOP: direction-aware ratcheting
-            trail_distance = atr * self.config["trailing_atr_mult"]
+            trail_distance = atr * exit_cfg.get("trailing_atr_mult", self.config["trailing_atr_mult"])
             if is_long:
                 peak = pos.get("peak_price", entry)
                 trailing_stop = peak - trail_distance
@@ -2565,15 +2664,20 @@ class CryptoScalper:
             except (ValueError, TypeError):
                 elapsed_h = 0
 
-            if self.config.get("progressive_stop", False) and elapsed_h > 0:
-                max_hold = self.config["max_hold_hours"]
-                start_pct = self.config.get("progressive_stop_start_pct", 0.5)
-                end_mult = self.config.get("progressive_stop_end_mult", 0.3)
+            if exit_cfg.get("progressive_stop", self.config.get("progressive_stop", False)) and elapsed_h > 0:
+                max_hold = exit_cfg.get("max_hold_hours", self.config["max_hold_hours"])
+                start_pct = exit_cfg.get("progressive_stop_start_pct",
+                                         self.config.get("progressive_stop_start_pct", 0.5))
+                end_mult = exit_cfg.get("progressive_stop_end_mult",
+                                        self.config.get("progressive_stop_end_mult", 0.3))
                 hold_pct = elapsed_h / max_hold if max_hold > 0 else 0
 
                 if hold_pct >= start_pct:
                     progress = min(1.0, (hold_pct - start_pct) / (1.0 - start_pct))
-                    original_sl_dist = atr * self.config["sl_atr_mult"]
+                    # entry_sl_dist is the distance actually placed at entry
+                    # (incl. vol_adj) — fixes the vol_adj mismatch where the first
+                    # progressive tick discontinuously jumped the stop ~33% tighter.
+                    original_sl_dist = entry_sl_dist
                     tight_sl_dist = original_sl_dist * end_mult
                     current_sl_dist = original_sl_dist - (original_sl_dist - tight_sl_dist) * progress
 
@@ -2590,8 +2694,8 @@ class CryptoScalper:
                             logger.debug(f"[{pos['id']}] Progressive stop tightened to {new_sl:.6f} "
                                        f"({hold_pct:.0%} of max hold)")
 
-            # 6. TIME EXIT
-            if elapsed_h > self.config["max_hold_hours"]:
+            # 6. TIME EXIT (entry-time snapshot, not current regime's hold limit)
+            if elapsed_h > exit_cfg.get("max_hold_hours", self.config["max_hold_hours"]):
                 to_close.append((pos, "time_exit", current))
                 continue
 
@@ -2619,9 +2723,11 @@ class CryptoScalper:
         if pnl > 0:
             self.state.winning_trades += 1
             self.state.consecutive_losses = 0
-        else:
+        elif pnl < 0:
             self.state.last_loss_time = time.time()
             self.state.consecutive_losses += 1
+        # 2026-07-03 audit fix: pnl == 0 (scratch close) is neither win nor loss —
+        # it previously counted as a loss and started the 3-min cooldown.
 
         if self.state.bankroll > self.state.peak_bankroll:
             self.state.peak_bankroll = self.state.bankroll
@@ -2672,13 +2778,27 @@ class CryptoScalper:
         self._record_analytics(closed)
 
         # v3.0: Update signal performance bandit
+        # 2026-07-03 audit fix: only driver components get credit (penalty
+        # components were absorbing win/loss credit for the opposite direction),
+        # and labels are direction-split so RSI_OVERBOUGHT@sell (a real winner)
+        # is tracked apart from its buy-penalty role.
+        side = pos.get("side", "buy")
+        drivers = [
+            c for c in pos.get("components", [])
+            if not (side == "buy" and c in BUY_PENALTY_COMPONENTS)
+        ]
         self.bandit.record(
-            components=pos.get("components", []),
+            components=[f"{c}@{side}" for c in drivers],
             won=(pnl > 0),
         )
+        self.state.bandit_state = self.bandit.to_dict()
 
-        # Auto-tune after every 20 closed trades
-        if len(self.state.closed_trades) > 0 and len(self.state.closed_trades) % 20 == 0:
+        # Auto-tune after every 20 closed trades.
+        # 2026-07-03 audit fix: the old `len % 20 == 0` trigger fired on EVERY
+        # close once closed_trades saturated at its 500 cap (500 % 20 == 0).
+        self.state.trades_since_tune += 1
+        if self.state.trades_since_tune >= 20 and len(self.state.closed_trades) >= 20:
+            self.state.trades_since_tune = 0
             self._auto_tune()
 
     def _record_analytics(self, trade: dict):
@@ -2690,6 +2810,16 @@ class CryptoScalper:
         record = {
             "id": trade.get("id"),
             "pair": trade.get("pair"),
+            # 2026-07-03 audit fix: side and macro_regime were omitted, making the
+            # analytics file unable to distinguish longs from shorts or which
+            # macro regime a trade ran under — blocking every honest attribution.
+            "side": trade.get("side", ""),
+            "macro_regime": trade.get("macro_regime", ""),
+            "raw_score": trade.get("raw_score", 0),
+            "effective_min_confluence": trade.get("effective_min_confluence", 0),
+            "take_profit": trade.get("take_profit", 0),
+            "stop_loss": trade.get("stop_loss", 0),
+            "exit_params": trade.get("exit_params", {}),
             "opened_at": trade.get("opened_at"),
             "closed_at": trade.get("closed_at"),
             "entry_price": trade.get("entry_price"),
@@ -2834,26 +2964,45 @@ class CryptoScalper:
             "adjustments": [],
         }
 
-        # --- Apply adjustments ---
+        # --- Adjustments ---
+        # 2026-07-03 audit: the auto-tuner is LOG-ONLY until each rule is validated
+        # in the (fixed) backtester. Live it had (a) permanently deleted ETH/DOGE —
+        # two backtest-validated pairs — on 5-trade coin-flip samples, (b) ratcheted
+        # OB thresholds one-way forever, and (c) decayed regime kelly in-memory only
+        # (lost on restart). With auto_tune_apply=false, every rule below records a
+        # RECOMMEND entry in tuning.json instead of mutating config/state.
+        apply_tuning = self.config.get("auto_tune_apply", False)
         overall_wr = tuning["overall_win_rate"]
+
+        def _adjust(msg: str, mutate):
+            """Record an adjustment; only execute it when auto_tune_apply is true."""
+            if apply_tuning:
+                mutate()
+                tuning["adjustments"].append(msg)
+            else:
+                tuning["adjustments"].append(f"RECOMMEND (not applied): {msg}")
 
         # 1. If win rate < 40%, raise confluence threshold (be more selective)
         if overall_wr < 0.40 and len(trades) >= 20:
             old = self.config["min_confluence_score"]
-            self.config["min_confluence_score"] = min(old + 1, 7)
-            self.state.tuned_overrides["min_confluence_score"] = self.config["min_confluence_score"]
-            tuning["adjustments"].append(
-                f"Win rate {overall_wr:.0%} < 40%: raised min_confluence {old} → {self.config['min_confluence_score']}")
+            new = min(old + 1, 7)
+
+            def _m1(new=new):
+                self.config["min_confluence_score"] = new
+                self.state.tuned_overrides["min_confluence_score"] = new
+            _adjust(f"Win rate {overall_wr:.0%} < 40%: raise min_confluence {old} -> {new}", _m1)
 
         # 2. If win rate > 60%, can lower threshold to take more trades
         if overall_wr > 0.60 and len(trades) >= 30:
             old = self.config["min_confluence_score"]
-            self.config["min_confluence_score"] = max(old - 1, 3)
-            self.state.tuned_overrides["min_confluence_score"] = self.config["min_confluence_score"]
-            tuning["adjustments"].append(
-                f"Win rate {overall_wr:.0%} > 60%: lowered min_confluence {old} → {self.config['min_confluence_score']}")
+            new = max(old - 1, 3)
 
-        # 3. If a regime has <30% win rate with 5+ trades, avoid it
+            def _m2(new=new):
+                self.config["min_confluence_score"] = new
+                self.state.tuned_overrides["min_confluence_score"] = new
+            _adjust(f"Win rate {overall_wr:.0%} > 60%: lower min_confluence {old} -> {new}", _m2)
+
+        # 3. If a regime has <30% win rate with 5+ trades, flag it
         for regime, stats in regime_stats.items():
             wr = stats["wins"] / stats["total"] if stats["total"] > 0 else 0
             if wr < 0.30 and stats["total"] >= 5:
@@ -2865,31 +3014,34 @@ class CryptoScalper:
             new_thresh = round((avg_win_ob + avg_loss_ob) / 2, 2)
             if new_thresh > self.config["ob_strong_buy"]:
                 old = self.config["ob_strong_buy"]
-                self.config["ob_strong_buy"] = new_thresh
-                self.config["ob_strong_sell"] = -new_thresh
-                self.state.tuned_overrides["ob_strong_buy"] = new_thresh
-                self.state.tuned_overrides["ob_strong_sell"] = -new_thresh
-                tuning["adjustments"].append(
-                    f"OB imbalance: wins avg {avg_win_ob:.2f} vs losses {avg_loss_ob:.2f}. "
-                    f"Raised threshold {old} → {new_thresh}")
 
-        # 5. If a pair is consistently losing (>5 trades, <25% WR), remove it
+                def _m4(new_thresh=new_thresh):
+                    self.config["ob_strong_buy"] = new_thresh
+                    self.config["ob_strong_sell"] = -new_thresh
+                    self.state.tuned_overrides["ob_strong_buy"] = new_thresh
+                    self.state.tuned_overrides["ob_strong_sell"] = -new_thresh
+                _adjust(f"OB imbalance: wins avg {avg_win_ob:.2f} vs losses {avg_loss_ob:.2f}. "
+                        f"Raise threshold {old} -> {new_thresh}", _m4)
+
+        # 5. If a pair is consistently losing (>5 trades, <25% WR), flag it.
+        # NOTE: permanent removal at n=5 is a coin-flip test (1W-4L triggers it);
+        # it already deleted ETH and DOGE. Never auto-remove; recommend only.
         for pair, stats in pair_stats.items():
             wr = stats["wins"] / stats["total"] if stats["total"] > 0 else 0
             if wr < 0.25 and stats["total"] >= 5:
                 if pair in self.config["pairs"]:
-                    self.config["pairs"].remove(pair)
-                    if pair not in self.state.removed_pairs:
-                        self.state.removed_pairs.append(pair)
-                    tuning["adjustments"].append(
-                        f"Removed {pair}: {wr:.0%} win rate over {stats['total']} trades")
+                    def _m5(pair=pair):
+                        self.config["pairs"].remove(pair)
+                        if pair not in self.state.removed_pairs:
+                            self.state.removed_pairs.append(pair)
+                    _adjust(f"Remove {pair}: {wr:.0%} win rate over {stats['total']} trades "
+                            f"(small sample — validate in backtester first)", _m5)
 
         # 6. v3.5: If a macro regime has poor WR over 10+ trades, tighten its profile
         for mr_name, stats in macro_regime_stats.items():
             if mr_name == "unknown" or stats["total"] < 10:
                 continue
             mr_wr = stats["wins"] / stats["total"]
-            # Find the matching regime enum
             mr_enum = None
             for r in MacroRegime:
                 if r.value == mr_name:
@@ -2900,16 +3052,17 @@ class CryptoScalper:
                 old_conf = profile.get("min_confluence_score", 5)
                 new_conf = min(old_conf + 1, 9)
                 if new_conf != old_conf:
-                    profile["min_confluence_score"] = new_conf
-                    tuning["adjustments"].append(
-                        f"Macro regime '{mr_name}' WR={mr_wr:.0%} over {stats['total']}t: "
-                        f"raised confluence {old_conf} -> {new_conf}")
+                    def _m6a(profile=profile, new_conf=new_conf):
+                        profile["min_confluence_score"] = new_conf
+                    _adjust(f"Macro regime '{mr_name}' WR={mr_wr:.0%} over {stats['total']}t: "
+                            f"raise confluence {old_conf} -> {new_conf} (in-memory only)", _m6a)
                 old_kelly = profile.get("kelly_fraction", 0.10)
                 new_kelly = max(0.03, round(old_kelly - 0.01, 2))
                 if new_kelly != old_kelly:
-                    profile["kelly_fraction"] = new_kelly
-                    tuning["adjustments"].append(
-                        f"Macro regime '{mr_name}': reduced kelly {old_kelly} -> {new_kelly}")
+                    def _m6b(profile=profile, new_kelly=new_kelly):
+                        profile["kelly_fraction"] = new_kelly
+                    _adjust(f"Macro regime '{mr_name}': reduce kelly {old_kelly} -> {new_kelly} "
+                            f"(in-memory only)", _m6b)
 
         # Log results
         for adj in tuning["adjustments"]:
@@ -2944,7 +3097,12 @@ class CryptoScalper:
                 logger.info(f"New day ({today}): resetting daily P&L and trade count")
             self.state.daily_pnl = 0.0
             self.state.daily_trade_count = 0
-            self.state.consecutive_losses = 0  # Fresh start each day
+            # 2026-07-03 audit fix: only clear the loss streak if the 4h pause has
+            # already lapsed — the midnight reset was silently bypassing an active
+            # consecutive-loss cooldown.
+            pause_sec = 4 * 3600
+            if time.time() - self.state.last_loss_time >= pause_sec:
+                self.state.consecutive_losses = 0
             self.state.last_reset_date = today
             self._save_state()
 
