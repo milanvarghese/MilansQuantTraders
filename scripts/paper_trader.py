@@ -269,14 +269,23 @@ class PaperTrader:
         # never-resolved closes at pnl=0. Cap "crypto" and "event" categories at
         # 30 days; "near_expiry" is already capped at 2 days; "dutch_book" exempt
         # (those have their own time horizon based on the arb structure).
-        if opp.category in ("crypto", "event") and opp.end_date:
+        # 2026-07-28: also refuse ANY market whose end date already passed. The
+        # scanner kept surfacing a stale expired dutch-book (Seattle Sounders)
+        # whose price never updated; the bot opened it, check_exits expired it
+        # 1 second later at pnl=$0, and the 2h cooldown let it repeat ~15 times.
+        if opp.end_date:
             try:
-                end_dt = datetime.strptime(opp.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                end_dt = datetime.strptime(opp.end_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=timezone.utc)
                 days_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 86400
-                max_days = CONFIG.get("max_days_to_resolution", 30)
-                if days_left > max_days:
-                    logger.info(f"Skip: {days_left:.0f}d to resolution > {max_days}d cap for {opp.market_question[:40]}")
+                if days_left < 0:
+                    logger.info(f"Skip: market already past end date for {opp.market_question[:40]}")
                     return False
+                if opp.category in ("crypto", "event"):
+                    max_days = CONFIG.get("max_days_to_resolution", 30)
+                    if days_left > max_days:
+                        logger.info(f"Skip: {days_left:.0f}d to resolution > {max_days}d cap for {opp.market_question[:40]}")
+                        return False
             except (ValueError, TypeError):
                 pass
 
@@ -684,8 +693,11 @@ class PaperTrader:
         if analytics.get("status") == "ok":
             lines.append("")
             lines.append("  PERFORMANCE ANALYTICS (N={} trades):".format(analytics["n_trades"]))
-            lines.append("  Brier Score:    {:.4f} (target <0.15, random=0.25)".format(
-                analytics["brier_score"]))
+            if analytics.get("brier_score") is not None:
+                lines.append("  Brier Score:    {:.4f} (target <0.15, random=0.25) [n={}]".format(
+                    analytics["brier_score"], analytics.get("n_resolved", 0)))
+            else:
+                lines.append("  Brier Score:    n/a (no resolution-based closes yet)")
             lines.append("  Avg CLV:        {:+.1%} ({:.0%} positive)".format(
                 analytics["avg_clv"], analytics["pct_positive_clv"]))
             lines.append("  Profit Factor:  {:.1f}x".format(analytics["profit_factor"]))
@@ -713,12 +725,19 @@ class PaperTrader:
 
         # Brier score: mean((estimated_prob - actual_outcome)^2)
         # Lower = better. 0.25 = random coin flip. Target < 0.15.
+        # 2026-07-28 crash fix: actual_outcome is None for non-resolution exits
+        # (by design since 2026-07-03) — dict.get's default only applies when
+        # the KEY is missing, not when the value is None, so `prob - None`
+        # raised TypeError and killed the bot on 2026-07-19. Only trades with
+        # real resolution outcomes belong in the Brier calculation.
         brier_scores = []
         for t in closed:
+            outcome = t.get("actual_outcome")
+            if outcome is None:
+                continue
             prob = t.get("estimated_prob", 0.5)
-            outcome = t.get("actual_outcome", 1.0 if t.get("pnl", 0) > 0 else 0.0)
             brier_scores.append((prob - outcome) ** 2)
-        brier = sum(brier_scores) / len(brier_scores)
+        brier = sum(brier_scores) / len(brier_scores) if brier_scores else None
 
         # CLV stats
         clvs = [t.get("clv", 0) for t in closed if "clv" in t]
@@ -756,7 +775,8 @@ class PaperTrader:
         return {
             "status": "ok",
             "n_trades": len(closed),
-            "brier_score": round(brier, 4),
+            "n_resolved": len(brier_scores),
+            "brier_score": round(brier, 4) if brier is not None else None,
             "avg_clv": round(avg_clv, 4),
             "median_clv": round(median_clv, 4),
             "pct_positive_clv": round(pct_positive_clv, 4),
